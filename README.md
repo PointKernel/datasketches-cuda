@@ -38,12 +38,13 @@ If you are interested in making contributions to this site, please see our [Comm
 
 ## Scope
 
-This is a header-only INTERFACE library. The current release implements
-HyperLogLog with the `HLL_8` target type, byte-compatible with
-`datasketches::hll_sketch` for round-trip serialization. Other sketch families
-and HLL variants are on the roadmap (see [Known Issues](#known-issues)).
+This is a header-only INTERFACE library. It implements HyperLogLog with the
+`HLL_8` target type and an initial GPU Theta sketch with union, intersection,
+and A-not-B. HLL images and ordered, uncompressed compact Theta v3 images are
+compatible with `datasketches-cpp`. Other sketch families and variants remain
+on the roadmap (see [Known Issues](#known-issues)).
 
-Public header:
+HLL example:
 
 ```cpp
 #include <cuda/devices>
@@ -69,6 +70,29 @@ CUDA-touching member functions take an explicit `cuda::stream_ref` as the first
 argument; construction and deserialization also require an explicit device
 memory resource. Streams used with `update_async` or `merge_async` must be
 synchronized or otherwise ordered before the sketch is destroyed.
+
+Theta example:
+
+```cpp
+#include <datasketches/cuda/theta.hpp>
+
+datasketches::cuda::theta_sketch<std::uint64_t> a(stream, mr, /*lg_k=*/12);
+datasketches::cuda::theta_sketch<std::uint64_t> b(stream, mr, /*lg_k=*/12);
+a.update(stream, dev_a.begin(), dev_a.end());
+b.update(stream, dev_b.begin(), dev_b.end());
+
+a.intersect(stream, b);
+double estimate = a.get_estimate();
+
+auto bytes = a.serialize_compact(stream);
+auto cpu = datasketches::compact_theta_sketch::deserialize(
+  bytes.data(), bytes.size());
+```
+
+`theta_sketch` keeps ordered hashes in device memory. Batch updates use CUB
+transform, select, radix sort, unique, and merge primitives. Its batch and set
+operations currently synchronize because result counts determine subsequent
+allocation sizes.
 
 ## Build & Runtime Dependencies
 
@@ -136,6 +160,9 @@ any extra setup.
 ## Known Issues
 
 - **HLL_8 only.** `HLL_4` and `HLL_6` packing are not yet implemented; constructing with those throws `std::invalid_argument`. `AuxHashMap` (the HLL_4 exception table) is also pending.
+- **Initial Theta surface.** Theta currently accepts primitive numeric keys and
+  ordered, uncompressed compact-v3 images. Strings and byte spans, unordered or
+  update-sketch images, compressed v4, and legacy wire versions are pending.
 - **No LIST / SET deserialization.** The wire format's small-cardinality modes are rejected at parse. Sketches must already be in HLL mode.
 - **Round-trip diverges on `FLAGS` (oooFlag) and `hipAccum`.** GPU output always sets `oooFlag=1` (pins CPU side to the Composite estimator) and `hipAccum=0` (no HIP tracking on parallel atomic update). All other bytes round-trip exactly.
 - **CCCL uses a synthetic development version.** Until upstream tags a CCCL release containing the required cudax HLL policy and explicit stream / memory-resource APIs, `cmake/thirdparty/get_cccl.cmake` uses `CPMFindPackage` with synthetic version `3.5.1` and a pinned CCCL main commit. This prevents automatically accepting older CCCL installs from disk while keeping an explicit `CPM_CCCL_SOURCE` override available for development.
