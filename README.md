@@ -113,6 +113,7 @@ Fetched automatically via CPM at configure time (no manual install required):
 - [NVIDIA/cccl](https://github.com/NVIDIA/cccl) — pinned to commit `c95f99757cf95044ce82b905eec88ff40c851f7b` as synthetic version `3.5.1` while this library develops against unreleased cudax HLL APIs. This should move to a real CCCL release once the required APIs are tagged.
 - [apache/datasketches-cpp](https://github.com/apache/datasketches-cpp) `5.2.0` (fall-back if `find_package(DataSketches 5.0.0 CONFIG)` does not locate a system install)
 - [Catch2](https://github.com/catchorg/Catch2) `3.5.3` (test-only)
+- [NVIDIA/nvbench](https://github.com/NVIDIA/nvbench) (benchmark-only, fetched when `BUILD_BENCHMARKS=ON`)
 
 ## Compilation and Test
 
@@ -127,6 +128,7 @@ ctest --test-dir build --output-on-failure
 Common options:
 
 - `-DBUILD_TESTS=OFF` to skip building tests (defaults to `ON` at top level, `OFF` when consumed via `add_subdirectory`/CPM)
+- `-DBUILD_BENCHMARKS=ON` to build the nvbench benchmarks (defaults to `OFF`; binaries land in `build/benchmarks`)
 - `-DCMAKE_CUDA_ARCHITECTURES=<arch>` to target a specific GPU (e.g. `80` for A100; defaults to `native`)
 - `-DCPM_CCCL_SOURCE=/path/to/local/cccl` to point CPM at a local CCCL checkout instead of fetching
 

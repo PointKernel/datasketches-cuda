@@ -36,6 +36,9 @@ if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_LIST_DIR}")
   set(_default ON)
 endif()
 option(BUILD_TESTS "Build unit tests" ${_default})
+# Benchmarks default OFF even at top level: they pull in nvbench, which is not
+# needed for a plain build-and-test cycle.
+option(BUILD_BENCHMARKS "Build benchmarks" OFF)
 
 find_package(CUDAToolkit REQUIRED)
 
@@ -78,6 +81,10 @@ if(BUILD_TESTS)
   enable_testing()
   add_subdirectory(test/hll)
   add_subdirectory(test/theta)
+endif()
+
+if(BUILD_BENCHMARKS)
+  add_subdirectory(benchmarks)
 endif()
 
 # Install rules — always present, same as datasketches-cpp's convention.
