@@ -35,10 +35,14 @@ namespace datasketches::cuda {
 //! @brief GPU Theta sketch with ordered compact serialization compatible with
 //! the datasketches::compact_theta_sketch serialization version 3.
 //!
-//! Updates are batch-oriented and use CUB transform, select, radix sort, unique,
-//! and merge primitives. The retained hashes are always ordered and trimmed to
-//! the smallest k = 2^lg_k values. Union (merge), intersection, and A-not-B
-//! operate directly on those ordered device-resident hashes.
+//! Updates are batch-oriented. A single kernel hashes each key, screens it
+//! against theta, and compacts the survivors; CUB radix sort, unique, and merge
+//! primitives then fold those survivors into the retained set. An update that
+//! begins with theta at its maximum is split internally so theta tightens
+//! partway through the batch instead of after it. The retained hashes are always
+//! ordered and trimmed to the smallest k = 2^lg_k values. Union (merge),
+//! intersection, and A-not-B operate directly on those ordered device-resident
+//! hashes.
 //!
 //! The current migration supports primitive device keys, uncompressed ordered
 //! compact-v3 serialization, custom seeds, and p-sampling. It does not yet

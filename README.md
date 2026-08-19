@@ -89,10 +89,15 @@ auto cpu = datasketches::compact_theta_sketch::deserialize(
   bytes.data(), bytes.size());
 ```
 
-`theta_sketch` keeps ordered hashes in device memory. Batch updates use CUB
-transform, select, radix sort, unique, and merge primitives. Its batch and set
+`theta_sketch` keeps ordered hashes in device memory. A batch update runs one
+kernel that hashes, screens against theta, and compacts the survivors, then
+folds them in with CUB radix sort, unique, and merge primitives. An update that
+starts with theta at its maximum is split internally, so theta tightens partway
+through the batch rather than only at the end; without that, a large first batch
+would sort every key even though the sketch keeps only k. Its batch and set
 operations currently synchronize because result counts determine subsequent
-allocation sizes.
+allocation sizes, which puts a fixed cost on each call: prefer fewer, larger
+updates over many small ones.
 
 ## Build & Runtime Dependencies
 

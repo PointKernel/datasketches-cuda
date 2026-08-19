@@ -198,3 +198,50 @@ TEST_CASE("Theta validates constructor and compact image", "[theta][validation]"
       stream, ::cuda::std::span<const std::uint8_t>{truncated.data(), truncated.size()}, mr),
     std::invalid_argument);
 }
+
+TEST_CASE("Theta multi-chunk update matches a single CPU sketch", "[theta][parity][chunking]")
+{
+  // Large enough that update() splits the batch internally: the sketch enters
+  // with theta at its maximum, so the first chunk is bounded and later chunks
+  // run against a tightened theta. Parity with the CPU sketch must not depend
+  // on how the batch happens to be split.
+  constexpr std::uint8_t lg_k  = 12;
+  constexpr std::uint64_t seed = 9001;
+  auto keys                    = make_keys(5'000'000, 0xc0ffeeULL);
+
+  thrust::device_vector<std::uint64_t> device_keys = keys;
+  ::cuda::stream stream{::cuda::devices[0]};
+  auto mr = ::cuda::device_default_memory_pool(::cuda::devices[0]);
+  datasketches::cuda::theta_sketch<std::uint64_t> gpu(stream, mr, lg_k, seed);
+  gpu.update(stream, device_keys.begin(), device_keys.end());
+
+  REQUIRE(gpu.is_estimation_mode());
+  REQUIRE(gpu.get_num_retained() == (std::size_t{1} << lg_k));
+  REQUIRE(gpu.serialize_compact(stream) == theta_test::cpu_image(keys, lg_k, seed));
+}
+
+TEST_CASE("Theta batch splitting does not change the result", "[theta][chunking]")
+{
+  // The same keys fed as one call and as several must produce identical images,
+  // whether the split is the caller's or update()'s own.
+  constexpr std::uint8_t lg_k  = 11;
+  constexpr std::uint64_t seed = 9001;
+  auto keys                    = make_keys(3'000'000, 0xfeedfaceULL);
+
+  thrust::device_vector<std::uint64_t> device_keys = keys;
+  ::cuda::stream stream{::cuda::devices[0]};
+  auto mr = ::cuda::device_default_memory_pool(::cuda::devices[0]);
+
+  datasketches::cuda::theta_sketch<std::uint64_t> single(stream, mr, lg_k, seed);
+  single.update(stream, device_keys.begin(), device_keys.end());
+
+  datasketches::cuda::theta_sketch<std::uint64_t> split(stream, mr, lg_k, seed);
+  const std::size_t batch = 700'000;
+  for (std::size_t offset = 0; offset < device_keys.size(); offset += batch) {
+    const auto end = std::min(offset + batch, device_keys.size());
+    split.update(stream, device_keys.begin() + offset, device_keys.begin() + end);
+  }
+
+  REQUIRE(single.serialize_compact(stream) == split.serialize_compact(stream));
+  REQUIRE(single.serialize_compact(stream) == theta_test::cpu_image(keys, lg_k, seed));
+}

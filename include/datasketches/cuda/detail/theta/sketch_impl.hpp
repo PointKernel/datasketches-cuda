@@ -39,7 +39,6 @@
 #include <cub/device/device_merge.cuh>
 #include <cub/device/device_radix_sort.cuh>
 #include <cub/device/device_select.cuh>
-#include <cub/device/device_transform.cuh>
 
 #include <cuda/experimental/container.cuh>
 #include <cuda/experimental/execution.cuh>
@@ -48,6 +47,7 @@
 #include <datasketches/cuda/detail/common/error.hpp>
 #include <datasketches/cuda/detail/theta/policy.cuh>
 #include <datasketches/cuda/detail/theta/preamble.hpp>
+#include <datasketches/cuda/detail/theta/screen.cuh>
 
 #include <binomial_bounds.hpp>
 
@@ -196,16 +196,52 @@ struct sketch_impl {
     return {std::move(output), read_count_(stream, selected)};
   }
 
+  //! @brief Highest bit position that a hash below @p theta can occupy.
+  //!
+  //! Radix sort runs one pass per fixed number of bits, so bounding the key range
+  //! by theta drops whole passes once the sketch has left the initial
+  //! theta == max_theta state.
+  [[nodiscard]] static int significant_bits_(std::uint64_t theta) noexcept
+  {
+    int bits = 0;
+    while (theta != 0) {
+      ++bits;
+      theta >>= 1;
+    }
+    return bits == 0 ? 1 : bits;
+  }
+
   [[nodiscard]] buffer_result sort_unique_(::cuda::stream_ref stream,
                                            hash_buffer_type&& input,
-                                           std::size_t count) const
+                                           std::size_t count,
+                                           std::uint64_t bound) const
   {
     if (count == 0) return {std::move(input), 0};
     auto alternate = make_hash_buffer_(stream, count);
     cub::DoubleBuffer<hash_type> keys(input.data(), alternate.data());
-    DATASKETCHES_CUDA_TRY(
-      cub::DeviceRadixSort::SortKeys(keys, cub_count_(count), 0, 63, env_(stream)));
+    DATASKETCHES_CUDA_TRY(cub::DeviceRadixSort::SortKeys(
+      keys, cub_count_(count), 0, significant_bits_(bound), env_(stream)));
     return unique_sorted_(stream, keys.Current(), count);
+  }
+
+  //! @brief Hashes, screens, and compacts a key range in one pass.
+  template <class RandomAccessIt>
+  [[nodiscard]] buffer_result screen_(::cuda::stream_ref stream,
+                                      RandomAccessIt first,
+                                      std::size_t count) const
+  {
+    auto output = make_hash_buffer_(stream, count);
+    if (count == 0) return {std::move(output), 0};
+    auto selected = make_count_buffer_(stream);
+    screen_kernel<<<screen_grid_size(count), screen_block_threads, 0, stream.get()>>>(
+      first,
+      count,
+      theta_hash<Key>{seed_},
+      theta_,
+      output.data(),
+      reinterpret_cast<unsigned long long*>(selected.data()));
+    DATASKETCHES_CUDA_TRY(cudaGetLastError());
+    return {std::move(output), read_count_(stream, selected)};
   }
 
   [[nodiscard]] buffer_result merge_unique_(::cuda::stream_ref stream,
@@ -286,6 +322,52 @@ struct sketch_impl {
     is_empty_ = true;
   }
 
+  //! @brief Multiple of k a first chunk aims to cover.
+  //!
+  //! With theta at its maximum every key survives, so a chunk of this many keys
+  //! yields that many candidates for a sketch that keeps k. A few multiples of k
+  //! is enough to drive theta below its maximum whenever the batch holds at
+  //! least k distinct keys, while keeping the sort that chunk pays for small.
+  static constexpr std::size_t chunk_target_multiple = 16;
+
+  //! @brief Smallest chunk worth a launch.
+  //!
+  //! A chunk costs a kernel launch and a synchronization regardless of its size,
+  //! so very small k values should not produce correspondingly tiny chunks.
+  static constexpr std::size_t min_chunk_keys = std::size_t{1} << 20;
+
+  //! @brief Size of the next update chunk.
+  //!
+  //! Entering an update with theta at its maximum means no key is rejected, so a
+  //! single pass over a large batch would sort the whole batch even though the
+  //! sketch keeps only k entries. Splitting lets theta tighten partway through,
+  //! exactly as the CPU sketch does on every insert, after which the remaining
+  //! keys are screened rather than sorted.
+  //!
+  //! Once theta has left its maximum the sketch holds k entries and the pass
+  //! rate is bounded by k over the distinct keys seen, so the remainder is taken
+  //! in one pass; splitting further would only add launches. Chunks double while
+  //! theta does stay at its maximum, which bounds the pass count logarithmically
+  //! for a batch that holds fewer than k distinct keys.
+  [[nodiscard]] std::size_t next_chunk_(std::size_t remaining, std::size_t previous) const noexcept
+  {
+    if (theta_ != max_theta) return remaining;
+    const auto sized = std::max({chunk_target_multiple * k_(), min_chunk_keys, previous * 2});
+    return std::min(sized, remaining);
+  }
+
+  template <class RandomAccessIt>
+  void update_chunk_(::cuda::stream_ref stream, RandomAccessIt first, std::size_t count)
+  {
+    auto screened = screen_(stream, first, count);
+    if (screened.size == 0) return;
+
+    auto incoming = sort_unique_(stream, std::move(screened.data), screened.size, theta_);
+    auto combined =
+      merge_unique_(stream, hashes_.data(), hashes_.size(), incoming.data.data(), incoming.size);
+    install_(stream, combined.data.data(), combined.size, theta_, false, true);
+  }
+
   template <class RandomAccessIt>
   void update(::cuda::stream_ref stream, RandomAccessIt first, RandomAccessIt last)
   {
@@ -298,17 +380,14 @@ struct sketch_impl {
 
     is_empty_ = false;
 
-    auto hashed = make_hash_buffer_(stream, count);
-    DATASKETCHES_CUDA_TRY(cub::DeviceTransform::Transform(
-      first, hashed.data(), cub_count_(count), theta_hash<Key>{seed_}, env_(stream)));
-
-    auto screened = select_(stream, hashed.data(), count, screen_hash{theta_});
-    if (screened.size == 0) return;
-
-    auto incoming = sort_unique_(stream, std::move(screened.data), screened.size);
-    auto combined =
-      merge_unique_(stream, hashes_.data(), hashes_.size(), incoming.data.data(), incoming.size);
-    install_(stream, combined.data.data(), combined.size, theta_, false, true);
+    std::size_t offset   = 0;
+    std::size_t previous = 0;
+    while (offset < count) {
+      const auto chunk = next_chunk_(count - offset, previous);
+      update_chunk_(stream, first + offset, chunk);
+      offset += chunk;
+      previous = chunk;
+    }
   }
 
   template <class OtherMR>
