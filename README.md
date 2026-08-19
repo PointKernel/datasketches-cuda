@@ -90,8 +90,12 @@ auto cpu = datasketches::compact_theta_sketch::deserialize(
 ```
 
 `theta_sketch` keeps ordered hashes in device memory. A batch update runs one
-kernel that hashes, screens against theta, and compacts the survivors, then
-folds them in with CUB radix sort, unique, and merge primitives. An update that
+kernel that hashes, screens against theta, drops duplicates it can cheaply
+recognize, and compacts the survivors, then folds them in with CUB radix sort,
+unique, and merge primitives. The duplicate filter is best-effort: it changes
+only how much redundant work reaches the sort, never the result. Input whose
+duplicates arrive close together, such as sorted or grouped data, updates
+several times faster as a result. An update that
 starts with theta at its maximum is split internally, so theta tightens partway
 through the batch rather than only at the end; without that, a large first batch
 would sort every key even though the sketch keeps only k. Its batch and set

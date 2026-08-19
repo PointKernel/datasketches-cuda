@@ -36,8 +36,12 @@ namespace datasketches::cuda {
 //! the datasketches::compact_theta_sketch serialization version 3.
 //!
 //! Updates are batch-oriented. A single kernel hashes each key, screens it
-//! against theta, and compacts the survivors; CUB radix sort, unique, and merge
-//! primitives then fold those survivors into the retained set. An update that
+//! against theta, filters duplicates, and compacts the survivors; CUB radix
+//! sort, unique, and merge primitives then fold those survivors into the
+//! retained set. The duplicate filter is best-effort and never affects the
+//! result, only how much redundant work reaches the sort. It costs a few percent
+//! when duplicates are scattered and pays back several times over when they
+//! arrive together, as they do in sorted or grouped input. An update that
 //! begins with theta at its maximum is split internally so theta tightens
 //! partway through the batch instead of after it. The retained hashes are always
 //! ordered and trimmed to the smallest k = 2^lg_k values. Union (merge),
