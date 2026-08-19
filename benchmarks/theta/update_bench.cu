@@ -35,18 +35,26 @@ namespace {
 
 using key_type = std::uint64_t;
 
-//! @brief Generates keys with a controlled number of distinct values.
+//! @brief Generates keys with a controlled distinct count and arrival locality.
 //!
-//! The modulus sets the distinct count and the splitmix64 finalizer spreads the
-//! repeats, so duplicates do not arrive in runs. Duplicate-heavy input is the
-//! case that keeps theta high for longer, so it exercises a different part of
-//! the update path than fully distinct input does.
+//! `distinct` sets how many distinct values appear. `run` sets how many
+//! consecutive positions each one occupies before the next: `run == 1` scatters
+//! repeats `distinct` positions apart, while a large `run` makes them arrive in
+//! blocks the way sorted or grouped input does.
+//!
+//! Both axes matter and they are not interchangeable. Duplicate-heavy input
+//! keeps theta high for longer regardless of ordering, which exercises the
+//! chunking path. Locality separately decides whether repeats are visible to any
+//! kernel that only sees a bounded window of consecutive keys, so a benchmark
+//! that only ever generates `run == 1` cannot distinguish an optimization that
+//! exploits locality from one that does nothing.
 struct generate_key {
   std::uint64_t distinct;
+  std::uint64_t run;
 
   __host__ __device__ key_type operator()(std::uint64_t index) const noexcept
   {
-    std::uint64_t value = (index % distinct) + 0x9e3779b97f4a7c15ULL;
+    std::uint64_t value = ((index / run) % distinct) + 0x9e3779b97f4a7c15ULL;
     value ^= value >> 30;
     value *= 0xbf58476d1ce4e5b9ULL;
     value ^= value >> 27;
@@ -56,13 +64,15 @@ struct generate_key {
   }
 };
 
-thrust::device_vector<key_type> make_keys(std::size_t count, std::uint64_t distinct)
+thrust::device_vector<key_type> make_keys(std::size_t count,
+                                          std::uint64_t distinct,
+                                          std::uint64_t run = 1)
 {
   thrust::device_vector<key_type> keys(count);
   thrust::transform(thrust::counting_iterator<std::uint64_t>(0),
                     thrust::counting_iterator<std::uint64_t>(count),
                     keys.begin(),
-                    generate_key{distinct});
+                    generate_key{distinct, run});
   return keys;
 }
 
@@ -76,9 +86,10 @@ void theta_update_cold(nvbench::state& state)
   const auto num_keys     = static_cast<std::size_t>(state.get_int64("Keys"));
   const auto distinct_pct = state.get_int64("DistinctPct");
   const auto lg_k         = static_cast<std::uint8_t>(state.get_int64("LgK"));
+  const auto run          = static_cast<std::uint64_t>(state.get_int64("Run"));
   const auto distinct     = std::max<std::uint64_t>(1, num_keys * distinct_pct / 100);
 
-  const auto keys = make_keys(num_keys, distinct);
+  const auto keys = make_keys(num_keys, distinct, run);
   auto mr         = ::cuda::device_default_memory_pool(::cuda::devices[0]);
 
   state.add_element_count(num_keys, "Keys");
@@ -101,11 +112,12 @@ void theta_update_warm(nvbench::state& state)
   const auto num_keys     = static_cast<std::size_t>(state.get_int64("Keys"));
   const auto distinct_pct = state.get_int64("DistinctPct");
   const auto lg_k         = static_cast<std::uint8_t>(state.get_int64("LgK"));
+  const auto run          = static_cast<std::uint64_t>(state.get_int64("Run"));
   const auto distinct     = std::max<std::uint64_t>(1, num_keys * distinct_pct / 100);
 
   const auto prime_keys = std::max<std::size_t>(1, num_keys / 10);
-  const auto keys       = make_keys(num_keys, distinct);
-  const auto prime      = make_keys(prime_keys, std::max<std::uint64_t>(1, distinct / 10));
+  const auto keys       = make_keys(num_keys, distinct, run);
+  const auto prime      = make_keys(prime_keys, std::max<std::uint64_t>(1, distinct / 10), run);
   auto mr               = ::cuda::device_default_memory_pool(::cuda::devices[0]);
 
   // Saturate the sketch outside the timed region. Re-running the measured update
@@ -186,13 +198,15 @@ NVBENCH_BENCH(theta_update_cold)
   .set_name("theta_update_cold")
   .add_int64_axis("Keys", {1 << 20, 1 << 24, 100'000'000})
   .add_int64_axis("DistinctPct", {100, 1})
-  .add_int64_axis("LgK", {12});
+  .add_int64_axis("Run", {1, 2048})
+  .add_int64_axis("LgK", {12, 20});
 
 NVBENCH_BENCH(theta_update_warm)
   .set_name("theta_update_warm")
   .add_int64_axis("Keys", {1 << 20, 1 << 24, 100'000'000})
   .add_int64_axis("DistinctPct", {100, 1})
-  .add_int64_axis("LgK", {12});
+  .add_int64_axis("Run", {1, 2048})
+  .add_int64_axis("LgK", {12, 20});
 
 NVBENCH_BENCH(theta_update_batched)
   .set_name("theta_update_batched")
