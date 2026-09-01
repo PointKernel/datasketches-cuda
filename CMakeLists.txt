@@ -45,12 +45,12 @@ find_package(CUDAToolkit REQUIRED)
 include(cmake/thirdparty/get_cccl.cmake)
 
 # datasketches-cpp is a *public* dependency: include/datasketches/cuda/hll.hpp,
-# detail/hll/preamble.hpp, detail/hll/composite_finalizer.hpp, and
-# detail/hll/reduction_state.hpp all use upstream symbols (target_hll_type,
-# HllUtil, CompositeInterpolationXTable, HarmonicNumbers, INVERSE_POWERS_OF_2);
-# Theta uses upstream MurmurHash3, seed hashing, and binomial bounds. Configure
-# it at top level so consumers via add_subdirectory/CPM inherit the include dirs
-# and the `datasketches` target automatically.
+# detail/hll/preamble.hpp, detail/hll/sketch_impl.hpp, and
+# detail/hll/reduction_state.hpp use upstream symbols (target_hll_type,
+# HllUtil, and INVERSE_POWERS_OF_2); Theta uses upstream MurmurHash3, seed
+# hashing, and binomial bounds. Configure it at top level so consumers via
+# add_subdirectory/CPM inherit the include dirs and the `datasketches` target
+# automatically.
 include(cmake/thirdparty/get_datasketches_cpp.cmake)
 
 # When the host C++ compiler is from a non-system prefix (e.g. a bundled GCC),
