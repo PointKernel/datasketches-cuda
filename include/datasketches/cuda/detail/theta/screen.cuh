@@ -19,11 +19,12 @@
 
 #pragma once
 
-#include <cuda/atomic>
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
 
 #include <cuda_runtime.h>
+
+#include <datasketches/cuda/detail/theta/dedup_filter.cuh>
 
 namespace datasketches::cuda::detail::theta {
 
@@ -32,15 +33,6 @@ inline constexpr int screen_block_threads = 256;
 
 //! @brief Keys hashed per thread per grid-stride step by @ref screen_kernel.
 inline constexpr int screen_items_per_thread = 8;
-
-//! @brief Slots in the block-local duplicate filter of @ref screen_kernel.
-//!
-//! 1024 slots of 8 bytes is 8 KiB per block. Thread-count limits bind before
-//! shared memory does at that size on every architecture in the CUDA
-//! per-compute-capability table, so the filter costs no occupancy. Larger
-//! filters measured no better; the working set that fits is not the limiting
-//! factor, warp-level collapse is.
-inline constexpr ::cuda::std::size_t screen_filter_slots = 1024;
 
 //! @brief Keys handled by one block per grid-stride step of @ref screen_kernel.
 inline constexpr ::cuda::std::size_t screen_tile_keys =
@@ -69,24 +61,19 @@ inline constexpr ::cuda::std::size_t screen_tile_keys =
 //! intermediate array is never materialized, which halves the memory traffic of
 //! the screen.
 //!
-//! Survivors then pass a two-stage duplicate filter before being emitted. Both
-//! stages are best-effort: a missed duplicate only means one extra entry reaches
-//! the sort, which removes it anyway, so correctness never depends on either.
+//! Survivors then pass a duplicate filter before being emitted. The filter is
+//! best-effort: a missed duplicate only means one extra entry reaches the sort,
+//! which removes it anyway, so correctness never depends on it.
 //!
-//! The first stage collapses duplicates that are live in the same warp at the
-//! same instant. `__match_any_sync` groups lanes holding equal hashes and keeps
-//! one per group. This is where nearly all of the benefit comes from, because
-//! input whose duplicates are adjacent (sorted or grouped data) puts them in the
-//! same warp.
+//! When the filter asks for it, the first stage collapses duplicates that are
+//! live in the same warp at the same instant. `__match_any_sync` groups lanes
+//! holding equal hashes and keeps one per group. Input whose duplicates are
+//! adjacent (sorted or grouped data) puts them in the same warp, so this stage
+//! is where a locality-friendly workload gets most of its benefit.
 //!
-//! The second stage is a direct-mapped table indexed by `hash % slots`, which
-//! catches duplicates separated in time within a block. A slot holds a full
-//! 64-bit hash and a key is dropped only on an exact match, so two hashes
-//! colliding on a slot merely evict each other and both are emitted; a collision
-//! can never drop a distinct value. Being direct-mapped rather than
-//! open-addressed is what keeps it safe: cost is one load and one store no
-//! matter how full it is, with no probe chain to grow and no rehashing, so an
-//! oversubscribed filter simply stops hitting instead of falling off a cliff.
+//! The second stage is @ref block_filter, which catches duplicates separated in
+//! time within a block. Which structure that is, and what it costs, is the
+//! question the filter benchmark exists to answer; see dedup_filter.cuh.
 //!
 //! Compaction is warp-local: each thread counts its own survivors, a `__shfl_up`
 //! scan turns those counts into per-thread offsets, and one lane claims the
@@ -123,15 +110,8 @@ __global__ void screen_kernel(KeyIt keys,
   constexpr unsigned int full_mask  = 0xffffffffu;
   const unsigned int lane           = threadIdx.x % warp_width;
 
-  // Concurrent threads may race on a slot. Losing a remembered hash or emitting
-  // a duplicate are both harmless, so the race is by design, but it is still a
-  // race and the accesses are relaxed atomics rather than plain loads and stores.
-  using filter_cell = ::cuda::atomic_ref<::cuda::std::uint64_t, ::cuda::thread_scope_block>;
-  __shared__ ::cuda::std::uint64_t filter[screen_filter_slots];
-  for (auto i = static_cast<::cuda::std::size_t>(threadIdx.x); i < screen_filter_slots;
-       i += screen_block_threads) {
-    filter[i] = 0;
-  }
+  __shared__ block_filter filter;
+  filter.init(threadIdx.x, screen_block_threads);
   __syncthreads();
 
   // A grid from screen_grid_size covers the input in one step; the stride loop
@@ -152,19 +132,18 @@ __global__ void screen_kernel(KeyIt keys,
         idx < num_keys ? hasher(keys[idx]) : ::cuda::std::uint64_t{0};
       const bool survives = (hash != 0 && hash < theta);
 
-      // Stage one: one lane per distinct hash in this warp continues.
-      const auto peers = __match_any_sync(full_mask, survives ? hash : ::cuda::std::uint64_t{0});
-      const bool leader =
-        survives && (__ffs(static_cast<int>(peers)) - 1) == static_cast<int>(lane);
+      bool candidate = survives;
+      if constexpr (filter_warp_collapse) {
+        const auto peers = __match_any_sync(full_mask, survives ? hash : ::cuda::std::uint64_t{0});
+        candidate =
+          survives && (__ffs(static_cast<int>(peers)) - 1) == static_cast<int>(lane);
+      }
 
-      // Stage two: drop it if this block emitted the same hash recently.
-      if (leader) {
-        filter_cell cell{filter[hash % screen_filter_slots]};
-        if (cell.load(::cuda::memory_order_relaxed) != hash) {
-          cell.store(hash, ::cuda::memory_order_relaxed);
-          hashes[i] = hash;
-          ++mine;
-        }
+      // Every lane calls admit so the filter may use warp-collective operations;
+      // `candidate` marks the lanes that actually hold a surviving hash.
+      if (filter.admit(hash, candidate)) {
+        hashes[i] = hash;
+        ++mine;
       }
     }
 
@@ -175,18 +154,18 @@ __global__ void screen_kernel(KeyIt keys,
       if (lane >= offset) { scan += prev; }
     }
     const int warp_total = __shfl_sync(full_mask, scan, warp_width - 1);
-    if (warp_total == 0) { continue; }
+    if (warp_total != 0) {
+      unsigned long long warp_base = 0;
+      if (lane == warp_width - 1) {
+        warp_base = atomicAdd(out_count, static_cast<unsigned long long>(warp_total));
+      }
+      warp_base = __shfl_sync(full_mask, warp_base, warp_width - 1);
 
-    unsigned long long warp_base = 0;
-    if (lane == warp_width - 1) {
-      warp_base = atomicAdd(out_count, static_cast<unsigned long long>(warp_total));
-    }
-    warp_base = __shfl_sync(full_mask, warp_base, warp_width - 1);
-
-    auto cursor = warp_base + static_cast<unsigned long long>(scan - mine);
+      auto cursor = warp_base + static_cast<unsigned long long>(scan - mine);
 #pragma unroll
-    for (int i = 0; i < screen_items_per_thread; ++i) {
-      if (hashes[i] != 0) { out[cursor++] = hashes[i]; }
+      for (int i = 0; i < screen_items_per_thread; ++i) {
+        if (hashes[i] != 0) { out[cursor++] = hashes[i]; }
+      }
     }
   }
 }
