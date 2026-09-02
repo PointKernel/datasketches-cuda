@@ -126,6 +126,7 @@ struct block_filter {
   using key_type   = ::cuda::std::uint64_t;
   using slot_type  = key_type;
 
+  // `int` rather than a sized type because cuco's template parameter is `int`.
   static constexpr int bucket_size           = DSCUDA_THETA_FILTER_BUCKET;
   using probing_scheme                       = cuco::linear_probing<1, identity_hash>;
   static constexpr ::cuda::std::size_t slots = DSCUDA_THETA_FILTER_SLOTS;
@@ -143,16 +144,16 @@ struct block_filter {
                                                                           false>;
 
   //! @brief Occupied slots above which the table is bypassed rather than probed.
-  static constexpr int load_limit =
-    static_cast<int>(slots * DSCUDA_THETA_FILTER_LOAD_PCT / 100);
+  static constexpr ::cuda::std::int32_t load_limit =
+    static_cast<::cuda::std::int32_t>(slots * DSCUDA_THETA_FILTER_LOAD_PCT / 100);
 
   //! @brief Zero is never a valid Theta hash, so it is free as the empty sentinel.
   static constexpr key_type empty_key = 0;
 
-  using counter_type = ::cuda::atomic_ref<int, ::cuda::thread_scope_block>;
+  using counter_type = ::cuda::atomic_ref<::cuda::std::int32_t, ::cuda::thread_scope_block>;
 
   slot_type table[slots];
-  int occupancy;
+  ::cuda::std::int32_t occupancy;
 
   [[nodiscard]] __device__ set_ref_type ref() noexcept
   {
@@ -160,7 +161,7 @@ struct block_filter {
       empty_key, ::cuda::std::equal_to<key_type>{}, probing_scheme{}, storage_ref_type{table, slots}};
   }
 
-  __device__ void init(unsigned int thread, unsigned int threads) noexcept
+  __device__ void init(::cuda::std::uint32_t thread, ::cuda::std::uint32_t threads) noexcept
   {
     for (auto i = static_cast<::cuda::std::size_t>(thread); i < slots; i += threads) {
       table[i] = empty_key;
