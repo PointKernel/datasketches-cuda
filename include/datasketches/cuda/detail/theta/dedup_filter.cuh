@@ -20,82 +20,59 @@
 
 #pragma once
 
-#include <cuda/atomic>
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
 #include <cuda/std/functional>
-#include <cuda/std/span>
-#include <cuda/std/utility>
 
 #include <cuda_runtime.h>
 
 #include <cuda/experimental/__cuco/capacity.cuh>
 #include <cuda/experimental/__cuco/detail/open_addressing/open_addressing_ref_impl.cuh>
 #include <cuda/experimental/__cuco/detail/open_addressing/slot_storage_ref.cuh>
-#include <cuda/experimental/__cuco/fixed_capacity_map_ref.cuh>
 #include <cuda/experimental/__cuco/probing_scheme.cuh>
-#include <cuda/experimental/__cuco/types.cuh>
 
 //! @file
 //! @brief Block-local duplicate filter backed by a cuCollections open-addressing
-//! table in shared memory.
+//! set in shared memory, retrieved in bulk rather than emitted per key.
 //!
-//! An exact set is the obvious way to deduplicate within a block: an insert both
-//! tests membership and claims ownership, and unlike a direct-mapped cache two
-//! hashes that collide do not evict each other. The reason this is not simply
-//! better is that open addressing has a nonlinear occupancy curve. Cheap while
-//! the table is empty, it degenerates into long probe chains as it fills, and a
-//! table that is actually full makes every further distinct key walk every
-//! bucket before failing.
+//! An exact set is the natural structure for this job: an insert both tests
+//! membership and claims ownership, so unlike a direct-mapped cache two hashes
+//! that collide do not evict each other. What makes open addressing dangerous is
+//! that it degenerates as it fills, and a full table is worse than slow, because
+//! `insert` returns a bare `bool` that cannot distinguish "already present" from
+//! "no room left". Treating the second as the first silently drops distinct
+//! hashes.
 //!
-//! That failure mode is the whole problem, and it is worse than slow. This
-//! CCCL revision's `fixed_capacity_map_ref` exposes `insert` returning a plain
-//! `bool`, so a false result cannot distinguish "already present" from "table
-//! full". Dropping every false loses distinct hashes and corrupts the sketch;
-//! emitting every false gives up nearly all deduplication. There is no correct
-//! one-pass filter to be had from the return value alone.
+//! Capacity is guaranteed rather than policed. A tile offers at most
+//! @ref screen_tile_keys distinct hashes and the table holds twice that, so the
+//! load can never exceed one half, a probe can never run against a full table,
+//! and a failed insert is therefore unambiguously a duplicate. No occupancy
+//! counter and no bypass path are needed. @ref init runs once per tile, which is
+//! what keeps the invariant true under a grid-stride loop.
 //!
-//! The design here removes the ambiguity instead of trying to resolve it, by
-//! never letting the table reach the state that produces it:
+//! Insertion is also the output. Survivors are not emitted as they are found;
+//! the screen kernel retrieves every occupied slot once the tile is done, the
+//! way `cuco::static_map::retrieve_all` does for a device-wide container. That
+//! removes the per-key register staging, and it makes the emitted range exactly
+//! deduplicated within the block rather than best-effort. The cost is that the
+//! retrieval is proportional to capacity rather than to the hashes found, which
+//! an insert returning the slot it claimed would fix; this revision of cuco does
+//! not offer one.
 //!
-//! - A shared counter tracks occupied slots. Above @ref load_limit the filter
-//!   stops consulting the table and emits, so a probe never runs against a table
-//!   that could be full and `insert == false` therefore always means duplicate.
-//! - The counter is read before the insert and incremented after it, so it can
-//!   only lag by the inserts currently in flight, which is bounded by the block
-//!   width. With the limit at half of capacity the true load stays under 75%
-//!   even in the worst interleaving, well inside the flat part of the curve.
-//! - Degrading to pass-through rather than resetting is what keeps the cost
-//!   proportional to the benefit. Input distinct enough to saturate the table is
-//!   input with no duplicates to find, so the filter stops paying for a lookup
-//!   that was not going to hit. Resetting instead would buy a fresh table for
-//!   that same input at the price of a block-wide barrier per reset.
-//! - Nothing here needs a barrier or a warp-collective operation, so the filter
-//!   composes with the screen kernel's divergent leader selection unchanged.
-//!
+//! The slot is the key alone. The public `fixed_capacity_map_ref` stores a
+//! key/payload pair that pads to 16 bytes and the payload is never read here, so
+//! this uses the open-addressing implementation directly to get an 8-byte slot.
 //! The Theta hash is already a well-mixed Murmur output truncated below theta,
-//! so the table hashes with identity: its low bits are uniform, and re-mixing
-//! them would only add latency to every probe.
+//! so the table hashes with identity: re-mixing uniform bits only adds latency.
 
-//! @brief Slots in the table. Overridable to sweep capacity.
-//!
-//! 1024 slots of 16 bytes is 16 KiB per block, which still lets the full 2048
-//! threads per SM resident on this architecture keep their blocks resident, so
-//! the table costs no occupancy. Note that a slot is a key/payload pair even
-//! though only the key is used: this revision of cuco offers a map and no set,
-//! so the payload is dead weight the direct-mapped alternatives do not carry.
+//! @brief Slots in the table. Must be at least twice @ref screen_tile_keys.
 #ifndef DSCUDA_THETA_FILTER_SLOTS
-#  define DSCUDA_THETA_FILTER_SLOTS 1024
+#  define DSCUDA_THETA_FILTER_SLOTS 2048
 #endif
 
 //! @brief Slots per bucket, i.e. how many slots one probe step examines.
 #ifndef DSCUDA_THETA_FILTER_BUCKET
 #  define DSCUDA_THETA_FILTER_BUCKET 1
-#endif
-
-//! @brief Percent of capacity above which the filter stops consulting the table.
-#ifndef DSCUDA_THETA_FILTER_LOAD_PCT
-#  define DSCUDA_THETA_FILTER_LOAD_PCT 50
 #endif
 
 #define DSCUDA_THETA_STRINGIFY_(x) #x
@@ -107,7 +84,7 @@ namespace cuco = ::cuda::experimental::cuco;
 
 inline constexpr char filter_name[] =
   "cucoset" DSCUDA_THETA_STRINGIFY(DSCUDA_THETA_FILTER_SLOTS) "b" DSCUDA_THETA_STRINGIFY(
-    DSCUDA_THETA_FILTER_BUCKET) "l" DSCUDA_THETA_STRINGIFY(DSCUDA_THETA_FILTER_LOAD_PCT);
+    DSCUDA_THETA_FILTER_BUCKET);
 inline constexpr bool filter_warp_collapse = true;
 
 //! @brief Hashes a Theta hash to itself.
@@ -123,8 +100,8 @@ struct identity_hash {
 };
 
 struct block_filter {
-  using key_type   = ::cuda::std::uint64_t;
-  using slot_type  = key_type;
+  using key_type  = ::cuda::std::uint64_t;
+  using slot_type = key_type;
 
   // `int` rather than a sized type because cuco's template parameter is `int`.
   static constexpr int bucket_size           = DSCUDA_THETA_FILTER_BUCKET;
@@ -136,52 +113,44 @@ struct block_filter {
 
   using storage_ref_type =
     cuco::__open_addressing::__slot_storage_ref<slot_type, bucket_size, slots>;
-  using set_ref_type = cuco::__open_addressing::__open_addressing_ref_impl<key_type,
-                                                                          ::cuda::thread_scope_block,
-                                                                          ::cuda::std::equal_to<key_type>,
-                                                                          probing_scheme,
-                                                                          storage_ref_type,
-                                                                          false>;
-
-  //! @brief Occupied slots above which the table is bypassed rather than probed.
-  static constexpr ::cuda::std::int32_t load_limit =
-    static_cast<::cuda::std::int32_t>(slots * DSCUDA_THETA_FILTER_LOAD_PCT / 100);
+  using set_ref_type =
+    cuco::__open_addressing::__open_addressing_ref_impl<key_type,
+                                                        ::cuda::thread_scope_block,
+                                                        ::cuda::std::equal_to<key_type>,
+                                                        probing_scheme,
+                                                        storage_ref_type,
+                                                        false>;
 
   //! @brief Zero is never a valid Theta hash, so it is free as the empty sentinel.
   static constexpr key_type empty_key = 0;
 
-  using counter_type = ::cuda::atomic_ref<::cuda::std::int32_t, ::cuda::thread_scope_block>;
-
   slot_type table[slots];
-  ::cuda::std::int32_t occupancy;
 
   [[nodiscard]] __device__ set_ref_type ref() noexcept
   {
-    return set_ref_type{
-      empty_key, ::cuda::std::equal_to<key_type>{}, probing_scheme{}, storage_ref_type{table, slots}};
+    return set_ref_type{empty_key,
+                        ::cuda::std::equal_to<key_type>{},
+                        probing_scheme{},
+                        storage_ref_type{table, slots}};
   }
 
+  //! @brief Returns every slot to the empty sentinel. Called once per tile.
   __device__ void init(::cuda::std::uint32_t thread, ::cuda::std::uint32_t threads) noexcept
   {
     for (auto i = static_cast<::cuda::std::size_t>(thread); i < slots; i += threads) {
       table[i] = empty_key;
     }
-    if (thread == 0) { occupancy = 0; }
   }
 
+  //! @brief Inserts a surviving hash; the return value says whether it was new.
+  //!
+  //! Callers do not emit on the return value. A successful insert leaves the
+  //! hash in the table for @ref screen_kernel to retrieve, and a failed one
+  //! means an identical hash is already there and will be retrieved instead.
   [[nodiscard]] __device__ bool admit(key_type hash, bool active) noexcept
   {
     if (!active) { return false; }
-
-    // Above the limit the table is left alone entirely. This is both the cost
-    // control and the correctness argument: no probe ever runs against a table
-    // that might be full, so a failed insert below is unambiguously a duplicate.
-    counter_type occupied{occupancy};
-    if (occupied.load(::cuda::memory_order_relaxed) >= load_limit) { return true; }
-
-    if (!ref().insert(hash)) { return false; }
-    occupied.fetch_add(1, ::cuda::memory_order_relaxed);
-    return true;
+    return ref().insert(hash);
   }
 };
 

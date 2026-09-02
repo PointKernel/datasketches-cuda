@@ -48,33 +48,58 @@ exploits locality from one that does nothing.
 Run-to-run spread on identical code is about 0.7%, so differences below roughly
 1.5% are not meaningful.
 
-| Filter | geomean r1 / r2 / r3 | mean | worst | local dups | no local dups | warm only |
-|---|---|---|---|---|---|---|
-| direct-mapped, 1024 slots | 1.193 / 1.193 / 1.195 | **1.194** | 0.79 | 1.545 | 0.922 | 1.082 |
-| cuco open-addressing set | 1.136 / 1.149 / 1.151 | **1.145** | 0.70 | 1.497 | 0.877 | 1.039 |
-| cuco open-addressing map | 1.068 / 1.068 / 1.082 | **1.073** | 0.55 | 1.404 | 0.820 | 0.968 |
+| Filter | mean geomean | worst | local dups | no local dups | warm only |
+|---|---|---|---|---|---|
+| direct-mapped, 1024 slots | **1.194** | 0.79 | 1.549 | 0.921 | 1.083 |
+| cuco set, retrieve_all, 2048 slots | **1.168** | 0.76 | 1.530 | 0.892 | 1.059 |
+| cuco set, guarded, 1024 slots | 1.145 | 0.70 | 1.497 | 0.877 | 1.039 |
+| cuco map, guarded, 1024 slots | 1.073 | 0.55 | 1.404 | 0.820 | 0.968 |
+
+Three successive redesigns of the cuco filter, each measured: map to key-only set
+(1.073 to 1.145), guard to a guaranteed 2:1 capacity ratio (1.145 to 1.162), and
+emit-as-you-go to bulk retrieval (1.162 to 1.168).
 
 ### Open-addressing set against the current direct-mapped cache
 
 | | |
 |---|---|
-| geomean, set relative to direct-mapped | **0.959** |
-| direct-mapped faster by | **4.2%** |
-| configurations the set wins | 54 of 360 |
-| set best case | 1.18x |
-| set worst case | 0.75x |
+| geomean, set relative to direct-mapped | **0.978** |
+| direct-mapped faster by | **2.3%** |
+| configurations the set wins | 31 of 240 |
+| set best case | 1.14x |
+| set worst case | 0.87x |
 
-## Set versus map
+## Three things that made the cuco filter faster
 
-The public `fixed_capacity_map_ref` stores a `pair<uint64_t, uint32_t>` slot that
-pads to 16 bytes, and this filter never reads the payload. Using the
-open-addressing implementation directly with a key-only 8-byte slot halves the
-table and is worth 6.7% (1.073 to 1.145), the single largest improvement found.
-It also removes one atomic per insert: the map does a 64-bit CAS for the key and
-a 32-bit CAS for the payload, the set only the first.
+**Set instead of map, worth 6.7%.** `fixed_capacity_map_ref` stores a
+`pair<uint64_t, uint32_t>` slot that pads to 16 bytes, and this filter never
+reads the payload. A key-only 8-byte slot halves the table and removes one atomic
+per insert, since the map does a 64-bit CAS for the key and a 32-bit CAS for the
+payload. This required reaching past the public API.
 
-That required reaching past the public API, which is the strongest argument in
-this document for cuco exposing a key-only set. See "What cuco would need" below.
+**Guaranteed capacity instead of a policed one, worth 1.6%.** Halving the tile to
+1024 keys against a 2048-slot table makes the load at most one half by
+construction, so the occupancy counter, its per-key load and its per-insert
+atomic all disappear. The correctness argument becomes checkable by inspection.
+
+**Bulk retrieval instead of per-key emission, worth 0.5%.** Insertion becomes the
+output and the tile's occupied slots are retrieved at the end. This removes the
+per-key register staging, which dropped registers from 40 to 31.
+
+### What did not work
+
+**`__launch_bounds__` to force fewer registers: 0.800**, a catastrophic
+regression from spilling.
+
+**Vectorized clear and retrieval, plus an empty-table fast path: 1.147 against
+1.168.** Two lessons. Pairing slots into 128-bit accesses halves *instructions*
+but moves identical *traffic*, and shared wavefronts were the constraint, so it
+bought nothing. And the empty-table fast path almost never fires: once theta has
+tightened there are still a few survivors per block, not zero, so blocks pay the
+full scan anyway plus the new bookkeeping.
+
+The retrieval cost is therefore structural. Skipping it requires knowing which
+slots are occupied, which requires an insert that returns where it landed.
 
 ## Broader field, single run each
 
@@ -146,7 +171,13 @@ to reset it and pay a barrier each time, or to stop using it when full.
    filter, because a probe budget caps worst-case cost structurally rather than
    by external bookkeeping, and would make the guard unnecessary entirely.
 4. A cooperative `initialize` / `clear` on the ref, which legacy cuco has and
-   cudax does not, for a reset-per-tile strategy.
+   cudax does not, for the per-tile reset this filter performs by hand.
+5. **An insert that returns the slot it claimed.** Retrieval currently costs
+   O(capacity) per block no matter how few hashes it finds, and measurement
+   showed that cost cannot be optimized away without knowing which slots are
+   live. Legacy `insert_and_find` returns an iterator, which is exactly that.
+6. `retrieve_all` itself, which legacy cuco offers for device-wide containers and
+   cudax does not offer at all.
 
 Not needed: erase, `find`, a host-side owning container, cooperative group size
 above 1, dynamic capacity, or multimap semantics.
@@ -155,7 +186,11 @@ above 1, dynamic capacity, or multimap semantics.
 
 The exact set does what it was designed to do. It never falls off the
 open-addressing cliff, it is correct on every configuration, and against the
-duplicate-heavy inputs it exists to serve it reaches 1.497. It is still 4.2%
-behind a direct-mapped cache that costs ten lines and no library dependency,
-because the duplicates worth catching were mostly already removed by the free
-`__match_any_sync` stage that runs before either structure.
+duplicate-heavy inputs it exists to serve it reaches 1.530, within 1.2% of the
+direct-mapped cache. Three redesigns closed the overall gap from 5.6% to 2.3%.
+
+It is still behind a direct-mapped cache that costs ten lines and no library
+dependency, for a reason no amount of tuning addresses: the duplicates worth
+catching were mostly already removed by the free `__match_any_sync` stage that
+runs before either structure, so an exact set is paying for precision that has
+little left to find.

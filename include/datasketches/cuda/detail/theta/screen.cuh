@@ -32,7 +32,7 @@ namespace datasketches::cuda::detail::theta {
 inline constexpr int screen_block_threads = 256;
 
 //! @brief Keys hashed per thread per grid-stride step by @ref screen_kernel.
-inline constexpr int screen_items_per_thread = 8;
+inline constexpr int screen_items_per_thread = 4;
 
 //! @brief Keys handled by one block per grid-stride step of @ref screen_kernel.
 inline constexpr ::cuda::std::size_t screen_tile_keys =
@@ -71,9 +71,11 @@ inline constexpr ::cuda::std::size_t screen_tile_keys =
 //! adjacent (sorted or grouped data) puts them in the same warp, so this stage
 //! is where a locality-friendly workload gets most of its benefit.
 //!
-//! The second stage is @ref block_filter, which catches duplicates separated in
-//! time within a block. Which structure that is, and what it costs, is the
-//! question the filter benchmark exists to answer; see dedup_filter.cuh.
+//! The second stage is @ref block_filter, an exact set. Survivors are not
+//! emitted as they are found: insertion is the output, and once the tile is done
+//! every occupied slot is retrieved in bulk. That keeps the emitted range exactly
+//! deduplicated within the block and removes the per-key register staging. See
+//! dedup_filter.cuh for why the table can never fill.
 //!
 //! Compaction is warp-local: each thread counts its own survivors, a `__shfl_up`
 //! scan turns those counts into per-thread offsets, and one lane claims the
@@ -111,8 +113,6 @@ __global__ void screen_kernel(KeyIt keys,
   const unsigned int lane           = threadIdx.x % warp_width;
 
   __shared__ block_filter filter;
-  filter.init(threadIdx.x, screen_block_threads);
-  __syncthreads();
 
   // A grid from screen_grid_size covers the input in one step; the stride loop
   // keeps the kernel correct for any smaller grid a caller might pass.
@@ -120,14 +120,18 @@ __global__ void screen_kernel(KeyIt keys,
 
   for (auto base = static_cast<::cuda::std::size_t>(blockIdx.x) * screen_tile_keys; base < num_keys;
        base += stride) {
-    ::cuda::std::uint64_t hashes[screen_items_per_thread];
-    int mine = 0;
+    filter.init(threadIdx.x, screen_block_threads);
+    __syncthreads();
 
+    // Insertion IS the output: every surviving hash either claims a slot or is
+    // a proven duplicate of one already claimed. The tile offers at most
+    // screen_tile_keys distinct hashes into twice that many slots, so an insert
+    // can never fail for capacity, and nothing can be lost by not being emitted
+    // here. Unlike the emit-as-you-go filters this makes the table
+    // load-bearing for correctness rather than best-effort.
 #pragma unroll
     for (int i = 0; i < screen_items_per_thread; ++i) {
-      // strided within the tile so every load step stays fully coalesced
       const auto idx = base + i * screen_block_threads + threadIdx.x;
-      hashes[i]      = 0;
       const ::cuda::std::uint64_t hash =
         idx < num_keys ? hasher(keys[idx]) : ::cuda::std::uint64_t{0};
       const bool survives = (hash != 0 && hash < theta);
@@ -135,16 +139,20 @@ __global__ void screen_kernel(KeyIt keys,
       bool candidate = survives;
       if constexpr (filter_warp_collapse) {
         const auto peers = __match_any_sync(full_mask, survives ? hash : ::cuda::std::uint64_t{0});
-        candidate =
-          survives && (__ffs(static_cast<int>(peers)) - 1) == static_cast<int>(lane);
+        candidate = survives && (__ffs(static_cast<int>(peers)) - 1) == static_cast<int>(lane);
       }
+      (void)filter.admit(hash, candidate);
+    }
+    __syncthreads();
 
-      // Every lane calls admit so the filter may use warp-collective operations;
-      // `candidate` marks the lanes that actually hold a surviving hash.
-      if (filter.admit(hash, candidate)) {
-        hashes[i] = hash;
-        ++mine;
-      }
+    // Retrieve every occupied slot, the in-kernel equivalent of cuco's
+    // retrieve_all over a device-wide container. Two passes over this thread's
+    // strided slice rather than staging survivors in registers: shared reads are
+    // cheap and the register file is what bounds occupancy here.
+    int mine = 0;
+    for (auto slot = static_cast<::cuda::std::size_t>(threadIdx.x);
+         slot < block_filter::slots; slot += screen_block_threads) {
+      if (filter.table[slot] != 0) { ++mine; }
     }
 
     int scan = mine;
@@ -162,11 +170,13 @@ __global__ void screen_kernel(KeyIt keys,
       warp_base = __shfl_sync(full_mask, warp_base, warp_width - 1);
 
       auto cursor = warp_base + static_cast<unsigned long long>(scan - mine);
-#pragma unroll
-      for (int i = 0; i < screen_items_per_thread; ++i) {
-        if (hashes[i] != 0) { out[cursor++] = hashes[i]; }
+      for (auto slot = static_cast<::cuda::std::size_t>(threadIdx.x);
+           slot < block_filter::slots; slot += screen_block_threads) {
+        const auto value = filter.table[slot];
+        if (value != 0) { out[cursor++] = value; }
       }
     }
+    __syncthreads();
   }
 }
 
