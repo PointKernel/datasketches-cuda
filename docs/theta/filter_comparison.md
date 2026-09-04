@@ -69,6 +69,30 @@ emit-as-you-go to bulk retrieval (1.162 to 1.168).
 | set best case | 1.14x |
 | set worst case | 0.87x |
 
+## At scale the gap widens
+
+The 120-configuration matrix tops out at 100M keys, where the ~130 us of
+per-update fixed overhead is still 14% of the call and neither path is
+asymptotic. Sweeping to 2B keys (16 GB of input), U64, cold, `lg_k = 12`,
+throughput in Gkeys/s:
+
+| keys | dist | direct-mapped | cuco set | cuco vs direct |
+|---|---|---|---|---|
+| 100M | unique | 107 | 103 | -4% |
+| 2B | unique | 217 | 199 | **-8%** |
+| 100M | zipf | 100 | 92 | -9% |
+| 2B | zipf | 194 | 169 | **-13%** |
+| 100M | block_run | 79 | 82 | +4% |
+| 2B | block_run | 221 | 212 | -4% |
+
+Both scale the same way and neither falls off a cliff, but the cuco set's extra
+per-key cost, 140 instructions against 81 and a retrieval proportional to
+capacity, is a fixed tax that the fixed overhead was masking at 100M. Once that
+overhead amortizes, the tax is what is left. The 2.3% geomean deficit reported
+below is a 100M-key number; at production scale the honest figure is 8 to 13
+percent on realistic distributions, and the one case the set wins at 100M,
+`block_run`, it loses at 2B.
+
 ## Three things that made the cuco filter faster
 
 **Set instead of map, worth 6.7%.** `fixed_capacity_map_ref` stores a
@@ -187,7 +211,8 @@ above 1, dynamic capacity, or multimap semantics.
 The exact set does what it was designed to do. It never falls off the
 open-addressing cliff, it is correct on every configuration, and against the
 duplicate-heavy inputs it exists to serve it reaches 1.530, within 1.2% of the
-direct-mapped cache. Three redesigns closed the overall gap from 5.6% to 2.3%.
+direct-mapped cache. Three redesigns closed the overall gap from 5.6% to 2.3% at 100M keys; at 2B
+keys the gap is 8 to 13 percent on realistic inputs, see "At scale the gap widens".
 
 It is still behind a direct-mapped cache that costs ten lines and no library
 dependency, for a reason no amount of tuning addresses: the duplicates worth
