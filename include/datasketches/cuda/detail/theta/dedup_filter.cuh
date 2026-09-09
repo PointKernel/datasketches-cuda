@@ -17,7 +17,6 @@
  * under the License.
  */
 
-
 #pragma once
 
 #include <cuda/std/cstddef>
@@ -67,12 +66,12 @@
 
 //! @brief Slots in the table. Must be at least twice @ref screen_tile_keys.
 #ifndef DSCUDA_THETA_FILTER_SLOTS
-#  define DSCUDA_THETA_FILTER_SLOTS 2048
+#define DSCUDA_THETA_FILTER_SLOTS 2048
 #endif
 
 //! @brief Slots per bucket, i.e. how many slots one probe step examines.
 #ifndef DSCUDA_THETA_FILTER_BUCKET
-#  define DSCUDA_THETA_FILTER_BUCKET 1
+#define DSCUDA_THETA_FILTER_BUCKET 1
 #endif
 
 #define DSCUDA_THETA_STRINGIFY_(x) #x
@@ -82,9 +81,8 @@ namespace datasketches::cuda::detail::theta {
 
 namespace cuco = ::cuda::experimental::cuco;
 
-inline constexpr char filter_name[] =
-  "cucoset" DSCUDA_THETA_STRINGIFY(DSCUDA_THETA_FILTER_SLOTS) "b" DSCUDA_THETA_STRINGIFY(
-    DSCUDA_THETA_FILTER_BUCKET);
+inline constexpr char filter_name[] = "cucoset" DSCUDA_THETA_STRINGIFY(
+  DSCUDA_THETA_FILTER_SLOTS) "b" DSCUDA_THETA_STRINGIFY(DSCUDA_THETA_FILTER_BUCKET);
 inline constexpr bool filter_warp_collapse = true;
 
 //! @brief Hashes a Theta hash to itself.

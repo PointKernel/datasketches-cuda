@@ -38,7 +38,10 @@ template <class Key>
 struct theta_hash {
   detail::hll::normalizing_hasher<Key> hasher;
 
-  __host__ __device__ explicit constexpr theta_hash(::cuda::std::uint64_t seed) noexcept : hasher(seed) {}
+  __host__ __device__ explicit constexpr theta_hash(::cuda::std::uint64_t seed) noexcept
+    : hasher(seed)
+  {
+  }
 
   [[nodiscard]] __host__ __device__ constexpr ::cuda::std::uint64_t operator()(
     const Key& key) const noexcept
@@ -52,7 +55,8 @@ struct theta_hash {
 struct screen_hash {
   ::cuda::std::uint64_t theta;
 
-  [[nodiscard]] __host__ __device__ constexpr bool operator()(::cuda::std::uint64_t hash) const noexcept
+  [[nodiscard]] __host__ __device__ constexpr bool operator()(
+    ::cuda::std::uint64_t hash) const noexcept
   {
     return hash != 0 && hash < theta;
   }

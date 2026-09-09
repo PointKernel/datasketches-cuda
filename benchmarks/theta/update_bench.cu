@@ -126,8 +126,7 @@ struct generate_key {
   std::uint64_t distinct;
   distribution kind;
 
-  [[nodiscard]] __host__ __device__ std::uint64_t distinct_index(
-    std::uint64_t index) const noexcept
+  [[nodiscard]] __host__ __device__ std::uint64_t distinct_index(std::uint64_t index) const noexcept
   {
     switch (kind) {
       case distribution::unique: return index;
