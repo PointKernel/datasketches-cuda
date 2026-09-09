@@ -43,7 +43,9 @@ namespace datasketches::cuda {
 //! when duplicates are scattered and pays back several times over when they
 //! arrive together, as they do in sorted or grouped input. An update that
 //! begins with theta at its maximum is split internally so theta tightens
-//! partway through the batch instead of after it. The retained hashes are always
+//! partway through the batch instead of after it, and a large update is split
+//! so that the device scratch memory it needs is bounded by a fixed survivor
+//! budget rather than by the batch size. The retained hashes are always
 //! ordered and trimmed to the smallest k = 2^lg_k values. Union (merge),
 //! intersection, and A-not-B operate directly on those ordered device-resident
 //! hashes.
