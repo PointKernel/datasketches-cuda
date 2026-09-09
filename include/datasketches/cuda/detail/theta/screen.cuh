@@ -89,6 +89,15 @@ inline constexpr ::cuda::std::size_t screen_tile_keys =
 //! surviving lane in the warp, so each item costs an atomic. Aggregating all
 //! @ref screen_items_per_thread items into one atomic avoids both failure modes.
 //!
+//! The output buffer may be smaller than the input. Every write is bounded by
+//! @p capacity while @p out_count keeps counting exactly, so the host learns
+//! from `*out_count > capacity` that the buffer was too small and that the
+//! survivors written to it are only a subset. That lets the caller size the
+//! buffer from the expected survivor count instead of from the key count,
+//! which keeps scratch memory independent of the batch size, and retry with a
+//! smaller chunk on the rare occasion the expectation is exceeded. Only the
+//! first `min(*out_count, capacity)` slots of @p out are ever written.
+//!
 //! @note The output order is unspecified. Callers sort the survivors anyway.
 //!
 //! @tparam KeyIt Random-access iterator over the input keys
@@ -99,13 +108,17 @@ inline constexpr ::cuda::std::size_t screen_tile_keys =
 //! @param[in] hasher Theta hash functor
 //! @param[in] theta Current sketch theta; hashes must be non-zero and below it
 //! @param[out] out Receives the surviving hashes, unordered
-//! @param[in,out] out_count Running count of survivors written to @p out
+//! @param[in] capacity Number of slots in @p out; survivors beyond it are
+//!   counted but not written
+//! @param[in,out] out_count Running count of survivors, including any that did
+//!   not fit in @p out
 template <class KeyIt, class Hasher>
 __global__ void screen_kernel(KeyIt keys,
                               ::cuda::std::size_t num_keys,
                               Hasher hasher,
                               ::cuda::std::uint64_t theta,
                               ::cuda::std::uint64_t* __restrict__ out,
+                              ::cuda::std::size_t capacity,
                               unsigned long long* __restrict__ out_count)
 {
   constexpr unsigned int warp_width = 32;
@@ -150,8 +163,8 @@ __global__ void screen_kernel(KeyIt keys,
     // strided slice rather than staging survivors in registers: shared reads are
     // cheap and the register file is what bounds occupancy here.
     int mine = 0;
-    for (auto slot = static_cast<::cuda::std::size_t>(threadIdx.x);
-         slot < block_filter::slots; slot += screen_block_threads) {
+    for (auto slot = static_cast<::cuda::std::size_t>(threadIdx.x); slot < block_filter::slots;
+         slot += screen_block_threads) {
       if (filter.table[slot] != 0) { ++mine; }
     }
 
@@ -170,10 +183,13 @@ __global__ void screen_kernel(KeyIt keys,
       warp_base = __shfl_sync(full_mask, warp_base, warp_width - 1);
 
       auto cursor = warp_base + static_cast<unsigned long long>(scan - mine);
-      for (auto slot = static_cast<::cuda::std::size_t>(threadIdx.x);
-           slot < block_filter::slots; slot += screen_block_threads) {
+      for (auto slot = static_cast<::cuda::std::size_t>(threadIdx.x); slot < block_filter::slots;
+           slot += screen_block_threads) {
         const auto value = filter.table[slot];
-        if (value != 0) { out[cursor++] = value; }
+        if (value != 0) {
+          if (cursor < capacity) { out[cursor] = value; }
+          ++cursor;
+        }
       }
     }
     __syncthreads();

@@ -67,11 +67,27 @@ struct sketch_impl {
     std::size_t size;
   };
 
+  //! @brief Outcome of a bounded screen pass.
+  //!
+  //! The kernel counts every survivor but writes only as many as fit. When
+  //! @ref overflowed is set, @ref data holds an arbitrary subset of the
+  //! survivors and must be discarded; @ref count is still exact.
+  struct screen_result {
+    hash_buffer_type data;
+    std::size_t count;
+    bool overflowed;
+  };
+
   std::uint8_t lg_k_;
   std::uint64_t seed_;
   float p_;
   std::uint64_t theta_;
   bool is_empty_;
+  //! @brief Screen output capacity in hashes; see @ref survivor_budget_.
+  std::size_t survivor_budget_hashes_;
+  //! @brief Number of screen passes that overflowed and were retried. A
+  //! diagnostic for tests; it never influences a result.
+  std::size_t screen_overflows_;
   ::cuda::stream_ref allocation_stream_;
   MR mr_;
   hash_buffer_type hashes_;
@@ -82,6 +98,8 @@ struct sketch_impl {
       p_(check_p_(p)),
       theta_(starting_theta_(p_)),
       is_empty_(true),
+      survivor_budget_hashes_(default_survivor_budget_()),
+      screen_overflows_(0),
       allocation_stream_(stream),
       mr_(std::move(mr)),
       hashes_(make_hash_buffer_(stream, 0))
@@ -225,13 +243,22 @@ struct sketch_impl {
   }
 
   //! @brief Hashes, screens, and compacts a key range in one pass.
+  //!
+  //! The output buffer holds `min(count, survivor_budget_())` hashes rather
+  //! than one per key, so the scratch memory of an update is bounded by the
+  //! budget instead of by the batch. The kernel counts survivors exactly and
+  //! drops the writes that do not fit; the caller checks @ref
+  //! screen_result::overflowed and retries with a smaller chunk when that
+  //! happens. It cannot happen for a chunk of at most the budget, so a retry
+  //! loop that halves the chunk always terminates.
   template <class RandomAccessIt>
-  [[nodiscard]] buffer_result screen_(::cuda::stream_ref stream,
+  [[nodiscard]] screen_result screen_(::cuda::stream_ref stream,
                                       RandomAccessIt first,
                                       std::size_t count) const
   {
-    auto output = make_hash_buffer_(stream, count);
-    if (count == 0) return {std::move(output), 0};
+    const std::size_t capacity = std::min(count, survivor_budget_());
+    auto output                = make_hash_buffer_(stream, capacity);
+    if (count == 0) return {std::move(output), 0, false};
     auto selected = make_count_buffer_(stream);
     screen_kernel<<<screen_grid_size(count), screen_block_threads, 0, stream.get()>>>(
       first,
@@ -239,9 +266,11 @@ struct sketch_impl {
       theta_hash<Key>{seed_},
       theta_,
       output.data(),
+      capacity,
       reinterpret_cast<unsigned long long*>(selected.data()));
     DATASKETCHES_CUDA_TRY(cudaGetLastError());
-    return {std::move(output), read_count_(stream, selected)};
+    const std::size_t survivors = read_count_(stream, selected);
+    return {std::move(output), survivors, survivors > capacity};
   }
 
   [[nodiscard]] buffer_result merge_unique_(::cuda::stream_ref stream,
@@ -336,36 +365,157 @@ struct sketch_impl {
   //! so very small k values should not produce correspondingly tiny chunks.
   static constexpr std::size_t min_chunk_keys = std::size_t{1} << 20;
 
-  //! @brief Size of the next update chunk.
+  //! @brief Largest factor by which one chunk may exceed the one before it.
   //!
-  //! Entering an update with theta at its maximum means no key is rejected, so a
-  //! single pass over a large batch would sort the whole batch even though the
-  //! sketch keeps only k entries. Splitting lets theta tighten partway through,
-  //! exactly as the CPU sketch does on every insert, after which the remaining
-  //! keys are screened rather than sorted.
+  //! The survivor estimate that sizes a chunk partly rests on the duplicate
+  //! factor the previous pass showed, and input can change character. A pass
+  //! that overflows is screened again for nothing, so the growth cap keeps that
+  //! wasted pass proportional to the work already done, while still letting a
+  //! batch of any size be covered in a handful of chunks.
+  static constexpr std::size_t max_chunk_growth = 64;
+
+  //! @brief Margin between a chunk's expected survivors and the budget.
   //!
-  //! Once theta has left its maximum the sketch holds k entries and the pass
-  //! rate is bounded by k over the distinct keys seen, so the remainder is taken
-  //! in one pass; splitting further would only add launches. Chunks double while
-  //! theta does stay at its maximum, which bounds the pass count logarithmically
-  //! for a batch that holds fewer than k distinct keys.
-  [[nodiscard]] std::size_t next_chunk_(std::size_t remaining, std::size_t previous) const noexcept
+  //! Survivors of distinct keys are a binomial draw at the theta fraction, and
+  //! at millions of expected survivors ten percent is hundreds of standard
+  //! deviations, so a chunk sized this way cannot overflow on its own.
+  static constexpr double budget_margin = 1.1;
+
+  //! @brief Hedge applied to the measured duplicate factor.
+  //!
+  //! The duplicate factor is measured on the previous pass and only holds if
+  //! the input keeps its character. Doubling it before use means the screen can
+  //! overflow only if the share of keys getting past the duplicate filter more
+  //! than doubles from one chunk to the next.
+  static constexpr double duplicate_hedge = 2.0;
+
+  //! @brief Smallest survivor budget, in hashes, that any k is given.
+  //!
+  //! 2^22 hashes is 32 MiB of screen output. Below that the per-chunk fixed
+  //! costs (launch, readback, CUB temporary storage) start to show against the
+  //! streaming work, and above it the scratch footprint stops being negligible
+  //! next to the retained k entries for the lg_k values in common use.
+  static constexpr std::size_t min_survivor_budget = std::size_t{1} << 22;
+
+  //! @brief Default number of survivors a single screen pass may produce.
+  //!
+  //! The screen writes its survivors to a buffer that has to be allocated before
+  //! their count is known. Sizing it from the key count keeps the scratch memory
+  //! of an update proportional to the batch, which for a batch of 2^31 keys is
+  //! 16 GiB even though the survivors number about count times the pass rate.
+  //! Sizing it from a fixed budget instead, and cutting the batch into chunks
+  //! whose expected survivors fit, bounds scratch memory by the budget for any
+  //! batch. 16 k is already what the first chunk at maximum theta aims to
+  //! produce, so the budget is that or @ref min_survivor_budget, whichever is
+  //! larger; the minimum prevents small k from forcing tiny chunks.
+  [[nodiscard]] std::size_t default_survivor_budget_() const noexcept
   {
-    if (theta_ != max_theta) return remaining;
-    const auto sized = std::max({chunk_target_multiple * k_(), min_chunk_keys, previous * 2});
-    return std::min(sized, remaining);
+    return std::max(min_survivor_budget, chunk_target_multiple * k_());
   }
 
+  //! @brief Number of survivors a single screen pass may produce.
+  //!
+  //! Bounds the output buffer of @ref screen_ and, through @ref next_chunk_,
+  //! the scratch memory of @ref update. Defaults to @ref
+  //! default_survivor_budget_ and is only changed by tests, which shrink it to
+  //! force the overflow path.
+  [[nodiscard]] std::size_t survivor_budget_() const noexcept { return survivor_budget_hashes_; }
+
+  //! @brief Overrides the survivor budget. Intended for tests.
+  //!
+  //! Any positive budget yields the same result; a smaller one only costs more
+  //! chunks and, below the natural chunk sizes, overflow retries.
+  void set_survivor_budget_(std::size_t hashes)
+  {
+    if (hashes == 0) {
+      throw std::invalid_argument("theta_sketch survivor budget must be positive");
+    }
+    survivor_budget_hashes_ = hashes;
+  }
+
+  //! @brief Size of the next update chunk.
+  //!
+  //! Entering an update with theta at its maximum means no distinct key is
+  //! rejected, so a single pass over a large batch would sort the whole batch
+  //! even though the sketch keeps only k entries. Splitting lets theta tighten
+  //! partway through, exactly as the CPU sketch does on every insert, after
+  //! which the remaining keys are screened rather than sorted. Chunks double
+  //! while theta does stay at its maximum, which bounds the pass count
+  //! logarithmically for a batch that holds fewer than k distinct keys.
+  //!
+  //! Every chunk is also sized so that its expected survivors fit the survivor
+  //! budget with @ref budget_margin to spare, which is what bounds the screen
+  //! buffer. The expected survivor fraction is theta over the hash space, exact
+  //! for distinct keys, times the duplicate factor: the share of keys the
+  //! screen's duplicate filter lets through, which the previous pass measured
+  //! and which is orders of magnitude below one for grouped or repeated input.
+  //! Sizing from theta alone would cut such a batch into dozens of small chunks
+  //! that each pay a launch and a readback. The measured factor is hedged by
+  //! @ref duplicate_hedge before use, so an overflow takes a change in the
+  //! input's character; when the screen does overflow, nothing is installed and
+  //! the caller retries with a chunk sized from the exact survivor count of the
+  //! failed pass. That failed pass is wasted work, so whenever the estimate
+  //! leans on a duplicate factor small enough to make an overflow possible at
+  //! all, growth per chunk is capped at @ref max_chunk_growth to keep the waste
+  //! proportional to the work already done. Below maximum theta the chunk is
+  //! never smaller than @ref min_chunk_keys, which is within the default budget
+  //! so that floor cannot overflow either.
+  //!
+  //! @param remaining Keys of the batch not yet installed
+  //! @param previous Size of the last installed chunk, zero at the start
+  //! @param duplicate_factor Survivors per key of the last screen pass divided
+  //!   by the theta fraction that pass was screened at, nominally in [0, 1], or
+  //!   negative if no pass has run yet in this update
+  [[nodiscard]] std::size_t next_chunk_(std::size_t remaining,
+                                        std::size_t previous,
+                                        double duplicate_factor) const noexcept
+  {
+    const std::size_t budget = survivor_budget_();
+    const double theta_rate  = static_cast<double>(theta_) / static_cast<double>(max_theta);
+    const double hedged =
+      duplicate_factor >= 0.0 ? std::min(1.0, duplicate_hedge * duplicate_factor) : 1.0;
+    const double rate   = theta_rate * hedged;
+    const double target = rate > 0.0
+                            ? std::floor(static_cast<double>(budget) / (budget_margin * rate))
+                            : static_cast<double>(remaining);
+    std::size_t sized =
+      target >= static_cast<double>(remaining) ? remaining : static_cast<std::size_t>(target);
+    if (hedged < 1.0 && previous != 0 && sized / max_chunk_growth > previous) {
+      sized = previous * max_chunk_growth;
+    }
+    sized = std::max<std::size_t>(sized, 1);
+    if (theta_ == max_theta) {
+      const auto doubling = std::max({chunk_target_multiple * k_(), min_chunk_keys, previous * 2});
+      return std::min({doubling, sized, remaining});
+    }
+    return std::min(std::max(sized, min_chunk_keys), remaining);
+  }
+
+  //! @brief Outcome of folding one chunk into the sketch.
+  struct chunk_outcome {
+    //! True if the chunk was installed. False if the screen overflowed its
+    //! buffer, in which case nothing was installed and the sketch state is
+    //! unchanged; the caller must retry the same keys with a smaller chunk.
+    bool installed;
+    //! Exact number of survivors the screen counted, installed or not.
+    std::size_t survivors;
+  };
+
+  //! @brief Folds one chunk of keys into the sketch.
   template <class RandomAccessIt>
-  void update_chunk_(::cuda::stream_ref stream, RandomAccessIt first, std::size_t count)
+  [[nodiscard]] chunk_outcome update_chunk_(::cuda::stream_ref stream,
+                                            RandomAccessIt first,
+                                            std::size_t count)
   {
     auto screened = screen_(stream, first, count);
-    if (screened.size == 0) return;
+    if (screened.overflowed) { return {false, screened.count}; }
+    if (screened.count == 0) { return {true, 0}; }
 
-    auto incoming = sort_unique_(stream, std::move(screened.data), screened.size, theta_);
+    auto incoming = sort_unique_(stream, std::move(screened.data), screened.count, theta_);
     auto combined =
       merge_unique_(stream, hashes_.data(), hashes_.size(), incoming.data.data(), incoming.size);
     install_(stream, combined.data.data(), combined.size, theta_, false, true);
+    return {true, screened.count};
   }
 
   template <class RandomAccessIt>
@@ -378,13 +528,33 @@ struct sketch_impl {
     const auto count = static_cast<std::size_t>(distance);
     if (count == 0) return;
 
+    // Set up front rather than per chunk: an overflow retry leaves theta_ and
+    // hashes_ untouched, and a chunk whose keys are all rejected still counts
+    // as having been seen, so nothing below depends on this flag.
     is_empty_ = false;
 
-    std::size_t offset   = 0;
-    std::size_t previous = 0;
+    std::size_t offset      = 0;
+    std::size_t previous    = 0;
+    double duplicate_factor = -1.0;
     while (offset < count) {
-      const auto chunk = next_chunk_(count - offset, previous);
-      update_chunk_(stream, first + offset, chunk);
+      auto chunk = next_chunk_(count - offset, previous, duplicate_factor);
+      // Theta is fixed until something is installed, so a pass's survivors per
+      // key over the theta fraction it was screened at is its duplicate factor.
+      const double theta_rate = static_cast<double>(theta_) / static_cast<double>(max_theta);
+      auto outcome            = update_chunk_(stream, first + offset, chunk);
+      while (!outcome.installed) {
+        ++screen_overflows_;
+        duplicate_factor =
+          static_cast<double>(outcome.survivors) / static_cast<double>(chunk) / theta_rate;
+        // The exact survivor count of the failed pass usually lands the retry
+        // within the budget at once; halving guarantees progress regardless,
+        // since a chunk of at most the budget cannot overflow.
+        chunk = std::max<std::size_t>(
+          1, std::min(chunk / 2, next_chunk_(count - offset, previous, duplicate_factor)));
+        outcome = update_chunk_(stream, first + offset, chunk);
+      }
+      duplicate_factor =
+        static_cast<double>(outcome.survivors) / static_cast<double>(chunk) / theta_rate;
       offset += chunk;
       previous = chunk;
     }

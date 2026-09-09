@@ -98,7 +98,11 @@ duplicates arrive close together, such as sorted or grouped data, updates
 several times faster as a result. An update that
 starts with theta at its maximum is split internally, so theta tightens partway
 through the batch rather than only at the end; without that, a large first batch
-would sort every key even though the sketch keeps only k. Its batch and set
+would sort every key even though the sketch keeps only k. Every update is also
+cut so that the survivors of one pass fit a fixed budget, which bounds the
+scratch memory of an update at tens of MiB rather than at the size of the batch;
+chunks are sized from theta and from the duplicate rate the previous pass
+observed, so steady input pays no extra passes for it. Its batch and set
 operations currently synchronize because result counts determine subsequent
 allocation sizes, which puts a fixed cost on each call: prefer fewer, larger
 updates over many small ones.
