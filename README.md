@@ -100,7 +100,7 @@ starts with theta at its maximum is split internally, so theta tightens partway
 through the batch rather than only at the end; without that, a large first batch
 would sort every key even though the sketch keeps only k. Every update is also
 cut so that the survivors of one pass fit a fixed budget, which bounds the
-scratch memory of an update at tens of MiB rather than at the size of the batch;
+scratch memory of an update at around a hundred MiB rather than at the size of the batch;
 chunks are sized from theta and from the duplicate rate the previous pass
 observed, so steady input pays no extra passes for it. Its batch and set
 operations currently synchronize because result counts determine subsequent
