@@ -79,6 +79,16 @@ target_compile_features(datasketches_cuda INTERFACE cxx_std_17 cuda_std_17)
 
 if(BUILD_TESTS)
   enable_testing()
+  CPMAddPackage(
+    NAME Catch2
+    GITHUB_REPOSITORY catchorg/Catch2
+    VERSION 3.5.3
+  )
+  if(Catch2_SOURCE_DIR)
+    list(APPEND CMAKE_MODULE_PATH ${Catch2_SOURCE_DIR}/extras)
+  endif()
+  include(Catch)
+
   add_subdirectory(test/hll)
   add_subdirectory(test/theta)
 endif()

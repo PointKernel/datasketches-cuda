@@ -89,25 +89,27 @@ auto cpu = datasketches::compact_theta_sketch::deserialize(
   bytes.data(), bytes.size());
 ```
 
-`theta_sketch` keeps ordered hashes in device memory. A batch update runs one
+`theta_sketch` keeps ordered hashes in device memory. Each update chunk runs a
 kernel that hashes, screens against theta, drops duplicates it can cheaply
 recognize, and compacts the survivors, then folds them in with CUB radix sort,
 unique, and merge primitives. The duplicate filter is best-effort: it changes
-only how much redundant work reaches the sort, never the result. Input whose
-duplicates arrive close together, such as sorted or grouped data, updates
-several times faster as a result. An update that
-starts with theta at its maximum is split internally, so theta tightens partway
+only how much redundant work reaches the sort, never the result. Nearby
+duplicates, such as those in sorted or grouped data, reduce the number of
+survivors that need sorting. An update that
+starts with theta at its maximum is split internally, so theta can tighten partway
 through the batch rather than only at the end; without that, a large first batch
 would sort every key even though the sketch keeps only k. Every update is also
 cut so that the survivors of one pass fit a fixed budget, which bounds the
 scratch memory independently of the batch size. The survivor budget is
-`max(2^22, 16*k)` hashes; at `lg_k=12`, measured peak scratch for `2^31`-key
-updates is 56–119 MiB. The budget grows with k above the `2^22` floor. The
-chunks are sized from theta and from the duplicate rate the previous pass
-observed, so steady input pays no extra passes for it. Its batch and set
-operations currently synchronize because result counts determine subsequent
-allocation sizes, which puts a fixed cost on each call: prefer fewer, larger
-updates over many small ones.
+`max(2^22, 16*k)` hashes. At `lg_k=12`, the screen output alone is at most
+32 MiB; sorting and merging allocate additional buffers. The budget grows with
+k above the `2^22` floor. If fewer than k distinct keys keep theta at its maximum
+and the duplicate filter misses their repeats, each chunk still needs sorting.
+The chunks are sized from theta and from the duplicate rate the previous pass
+observed. Batch and set operations currently synchronize because result counts
+determine subsequent allocation sizes. This puts a fixed cost on each update
+chunk and each set-operation call: prefer fewer, larger updates over many small
+ones.
 
 ## Build & Runtime Dependencies
 
@@ -116,7 +118,9 @@ Required:
 - CMake >= 3.30
 - A C++17-capable host compiler (GCC 13.2+ verified; older GCC may work if it accepts C++17 and is supported by the CUDA toolkit)
 - CUDA Toolkit >= 12.0 (12.4 verified)
-- An NVIDIA GPU with compute capability supported by the active CUDA Toolkit (configured via `CMAKE_CUDA_ARCHITECTURES`; defaults to `native`)
+- An NVIDIA GPU supported by the active CUDA Toolkit (configured via
+  `CMAKE_CUDA_ARCHITECTURES`; defaults to `native`). Theta requires compute
+  capability 7.0 or newer because its screen kernel uses warp match intrinsics.
 
 Fetched automatically via CPM at configure time (no manual install required):
 
@@ -188,4 +192,6 @@ additional dependency setup.
 - **No LIST / SET deserialization.** The wire format's small-cardinality modes are rejected at parse. Sketches must already be in HLL mode.
 - **Round-trip diverges on `FLAGS` (oooFlag) and `hipAccum`.** GPU output always sets `oooFlag=1` (pins CPU side to the Composite estimator) and `hipAccum=0` (no HIP tracking on parallel atomic update). All other bytes round-trip exactly.
 - **CCCL uses a synthetic development version.** Until upstream tags a CCCL release containing the required cudax HLL policy and explicit stream / memory-resource APIs, `cmake/thirdparty/get_cccl.cmake` uses `CPMFindPackage` with synthetic version `3.5.2` and a pinned CCCL main commit. This prevents automatically accepting older CCCL installs from disk while keeping an explicit `CPM_CCCL_SOURCE` override available for development.
-- **No driver on some dev hosts.** CI gates the runtime parity test (`parity_test.cu`); host-only tests (preamble, reduction state, normalizing hasher, composite finalizer, policy compile) pass without a GPU.
+- **GPU runtime validation.** CI compiles the test binaries, but its GPU runtime
+  job is not enabled. Run `ctest --test-dir build --output-on-failure` on a host
+  with a supported GPU to validate runtime behavior and CPU/GPU parity.

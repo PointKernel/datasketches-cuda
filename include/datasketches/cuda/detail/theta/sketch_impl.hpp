@@ -54,7 +54,7 @@ namespace datasketches::cuda::detail::theta {
 template <class Key, class MR = ::cuda::device_memory_pool_ref>
 struct sketch_impl {
   using hash_type         = std::uint64_t;
-  using count_type        = std::uint64_t;
+  using count_type        = unsigned long long;
   using hash_buffer_type  = ::cuda::device_buffer<hash_type>;
   using count_buffer_type = ::cuda::device_buffer<count_type>;
   using env_type          = ::cuda::experimental::env_t<::cuda::mr::device_accessible>;
@@ -216,7 +216,7 @@ struct sketch_impl {
   }
 
   [[nodiscard]] buffer_result sort_unique_(::cuda::stream_ref stream,
-                                           hash_buffer_type&& input,
+                                           hash_buffer_type input,
                                            std::size_t count,
                                            std::uint64_t bound) const
   {
@@ -247,13 +247,7 @@ struct sketch_impl {
     if (count == 0) return {std::move(output), 0, false};
     auto selected = make_count_buffer_(stream);
     screen_kernel<<<screen_grid_size(count), screen_block_threads, 0, stream.get()>>>(
-      first,
-      count,
-      theta_hash<Key>{seed_},
-      theta_,
-      output.data(),
-      capacity,
-      reinterpret_cast<unsigned long long*>(selected.data()));
+      first, count, theta_hash<Key>{seed_}, theta_, output.data(), capacity, selected.data());
     DATASKETCHES_CUDA_TRY(cudaGetLastError());
     const std::size_t survivors = read_count_(stream, selected);
     return {std::move(output), survivors, survivors > capacity};
@@ -420,8 +414,10 @@ struct sketch_impl {
   //! even though the sketch keeps only k entries. Splitting lets theta tighten
   //! partway through, exactly as the CPU sketch does on every insert, after
   //! which the remaining keys are screened rather than sorted. Chunks double
-  //! while theta does stay at its maximum, which bounds the pass count
-  //! logarithmically for a batch that holds fewer than k distinct keys.
+  //! while theta stays at its maximum, until the survivor budget limits their
+  //! size. If fewer than k distinct keys keep theta at its maximum and the
+  //! duplicate filter misses their repeats, the pass count grows linearly
+  //! with the batch size divided by the survivor budget.
   //!
   //! Every chunk is also sized so that its expected survivors fit the survivor
   //! budget with @ref budget_margin to spare, which is what bounds the screen
@@ -511,11 +507,6 @@ struct sketch_impl {
     const auto count = static_cast<std::size_t>(distance);
     if (count == 0) return;
 
-    // Set up front rather than per chunk: an overflow retry leaves theta_ and
-    // hashes_ untouched, and a chunk whose keys are all rejected still counts
-    // as having been seen, so nothing below depends on this flag.
-    is_empty_ = false;
-
     std::size_t offset      = 0;
     std::size_t previous    = 0;
     double duplicate_factor = -1.0;
@@ -536,6 +527,10 @@ struct sketch_impl {
           1, std::min(chunk / 2, next_chunk_(count - offset, previous, duplicate_factor)));
         outcome = update_chunk_(stream, first + offset, chunk);
       }
+      // Commit the empty flag only after a chunk succeeds. A chunk whose keys
+      // are all rejected still counts as seen, but a failed first allocation
+      // must leave an empty sketch unchanged.
+      is_empty_ = false;
       duplicate_factor =
         static_cast<double>(outcome.survivors) / static_cast<double>(chunk) / theta_rate;
       offset += chunk;

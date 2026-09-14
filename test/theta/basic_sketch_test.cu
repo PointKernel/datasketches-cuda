@@ -24,6 +24,8 @@
 #include <cuda/memory_pool>
 #include <cuda/std/span>
 #include <cuda/stream>
+#include <limits>
+#include <new>
 #include <random>
 #include <vector>
 
@@ -37,6 +39,55 @@
 #include "cpu_reference.hpp"
 
 namespace {
+
+struct allocation_failure {
+  std::size_t allocations = 0;
+  std::size_t fail_at     = std::numeric_limits<std::size_t>::max();
+
+  void check()
+  {
+    if (allocations++ == fail_at) throw std::bad_alloc{};
+  }
+};
+
+struct failing_resource {
+  ::cuda::device_memory_pool_ref upstream;
+  allocation_failure* failure;
+
+  void* allocate_sync(std::size_t bytes, std::size_t alignment)
+  {
+    failure->check();
+    return upstream.allocate_sync(bytes, alignment);
+  }
+
+  void* allocate(::cuda::stream_ref stream, std::size_t bytes, std::size_t alignment)
+  {
+    failure->check();
+    return upstream.allocate(stream, bytes, alignment);
+  }
+
+  void deallocate_sync(void* ptr, std::size_t bytes, std::size_t alignment) noexcept
+  {
+    upstream.deallocate_sync(ptr, bytes, alignment);
+  }
+
+  void deallocate(::cuda::stream_ref stream,
+                  void* ptr,
+                  std::size_t bytes,
+                  std::size_t alignment) noexcept
+  {
+    upstream.deallocate(stream, ptr, bytes, alignment);
+  }
+
+  bool operator==(const failing_resource& other) const noexcept
+  {
+    return upstream == other.upstream && failure == other.failure;
+  }
+
+  bool operator!=(const failing_resource& other) const noexcept { return !(*this == other); }
+
+  friend void get_property(const failing_resource&, ::cuda::mr::device_accessible) noexcept {}
+};
 
 std::vector<std::uint64_t> make_keys(std::size_t count, std::uint64_t seed)
 {
@@ -86,6 +137,46 @@ TEST_CASE("Theta compact v3 bytes match CPU in exact mode", "[theta][parity][ser
   REQUIRE(gpu.serialize_compact(stream) == theta_test::cpu_image(keys, lg_k, seed));
   REQUIRE(gpu.get_num_retained() == 1000);
   REQUIRE(gpu.get_estimate() == 1000.0);
+}
+
+TEST_CASE("Theta failed first chunk preserves the empty sketch", "[theta][exception][resource]")
+{
+  constexpr std::uint8_t lg_k                      = 8;
+  constexpr std::uint64_t seed                     = 9001;
+  constexpr float p                                = 0.125F;
+  const auto keys                                  = make_keys(1000, 0xa110cULL);
+  thrust::device_vector<std::uint64_t> device_keys = keys;
+
+  ::cuda::stream allocation_stream{::cuda::devices[0]};
+  ::cuda::stream operation_stream{::cuda::devices[0]};
+  allocation_failure failure;
+  failing_resource mr{::cuda::device_default_memory_pool(::cuda::devices[0]), &failure};
+  datasketches::cuda::theta_sketch<std::uint64_t, failing_resource> sketch(
+    allocation_stream, mr, lg_k, seed, p);
+
+  SECTION("first allocation") { failure.fail_at = 0; }
+  SECTION("final allocation after screening and sorting")
+  {
+    // Learn the successful path's allocation count instead of depending on how
+    // many temporary allocations this CUB version makes.
+    failure.allocations = 0;
+    sketch.update(operation_stream, device_keys.begin(), device_keys.end());
+    REQUIRE(failure.allocations > 1);
+    const auto final_allocation = failure.allocations - 1;
+    sketch.reset(operation_stream);
+    failure.fail_at = final_allocation;
+  }
+  const auto before = sketch.serialize_compact(operation_stream);
+
+  failure.allocations = 0;
+  REQUIRE_THROWS_AS(sketch.update(operation_stream, device_keys.begin(), device_keys.end()),
+                    std::bad_alloc);
+  failure.fail_at = std::numeric_limits<std::size_t>::max();
+  REQUIRE(sketch.is_empty());
+  REQUIRE(sketch.serialize_compact(operation_stream) == before);
+
+  sketch.update(operation_stream, device_keys.begin(), device_keys.end());
+  REQUIRE(sketch.serialize_compact(operation_stream) == theta_test::cpu_image(keys, lg_k, seed, p));
 }
 
 TEST_CASE("Theta compact v3 bytes match trimmed CPU in estimation mode",
@@ -158,6 +249,39 @@ TEST_CASE("Theta compact v3 round trips through CPU and GPU", "[theta][serializa
   REQUIRE(restored.get_estimate() == Catch::Approx(source.get_estimate()));
 }
 
+TEST_CASE("Theta imports and updates CPU compact v3 images", "[theta][serialization][parity]")
+{
+  constexpr std::uint8_t lg_k  = 8;
+  constexpr std::uint64_t seed = 0xc0ffeeULL;
+  using sketch_type            = datasketches::cuda::theta_sketch<std::uint64_t>;
+  std::vector<std::uint64_t> keys;
+  float p = 1.0F;
+  SECTION("empty") {}
+  SECTION("single entry") { keys = {42}; }
+  SECTION("exact") { keys = make_keys(100, 1); }
+  SECTION("estimation") { keys = make_keys(10000, 2); }
+  SECTION("sampled with zero retained entries")
+  {
+    keys = {42};
+    p    = 0x1p-63F;
+  }
+
+  const auto bytes    = theta_test::cpu_image(keys, lg_k, seed, p);
+  const auto metadata = theta_test::cpu_metadata(bytes, seed);
+  ::cuda::stream stream{::cuda::devices[0]};
+  auto mr     = ::cuda::device_default_memory_pool(::cuda::devices[0]);
+  auto sketch = sketch_type::deserialize(
+    stream, ::cuda::std::span<const std::uint8_t>{bytes.data(), bytes.size()}, mr, lg_k, seed);
+  REQUIRE(sketch.serialize_compact(stream) == bytes);
+  REQUIRE(sketch.is_empty() == metadata.empty);
+
+  const std::vector<std::uint64_t> additional{42, 43, 44};
+  thrust::device_vector<std::uint64_t> device = additional;
+  sketch.update(stream, device.begin(), device.end());
+  keys.insert(keys.end(), additional.begin(), additional.end());
+  REQUIRE(sketch.serialize_compact(stream) == theta_test::cpu_image(keys, lg_k, seed, p));
+}
+
 TEST_CASE("Theta smallest sampling probability round trips", "[theta][sampling][serialization]")
 {
   constexpr float min_p        = 0x1p-63F;
@@ -217,6 +341,13 @@ TEST_CASE("Theta validates constructor and compact image", "[theta][validation]"
   REQUIRE_THROWS_AS(
     datasketches::cuda::theta_sketch<std::uint64_t>::deserialize(
       stream, ::cuda::std::span<const std::uint8_t>{truncated.data(), truncated.size()}, mr),
+    std::invalid_argument);
+
+  auto trailing = theta_test::cpu_image(std::vector<std::uint64_t>{42}, 12, 9001);
+  trailing.push_back(0);
+  REQUIRE_THROWS_AS(
+    datasketches::cuda::theta_sketch<std::uint64_t>::deserialize(
+      stream, ::cuda::std::span<const std::uint8_t>{trailing.data(), trailing.size()}, mr),
     std::invalid_argument);
 }
 

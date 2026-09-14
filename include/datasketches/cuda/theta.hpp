@@ -113,6 +113,9 @@ class theta_sketch {
   //! into the retained set. Large batches are split internally so theta tightens
   //! during the call. Completes the update before returning; an empty range is
   //! a no-op.
+  //! Chunks commit independently. If a later allocation fails, earlier chunks
+  //! remain installed; a failure before the first successful chunk leaves the
+  //! sketch unchanged.
   //!
   //! @tparam RandomAccessIt Random-access iterator type over device-accessible
   //!   keys.
@@ -132,7 +135,8 @@ class theta_sketch {
   //!
   //! @param[in] stream CUDA stream this operation is executed in.
   //! @param[in] other The other sketch to union into `*this`.
-  //! @throws std::invalid_argument if the two sketches disagree on seed hash.
+  //! @throws std::invalid_argument if the seed hashes disagree and no
+  //!   empty-sketch shortcut applies.
   template <class OtherMR>
   void merge(::cuda::stream_ref stream, const theta_sketch<Key, OtherMR>& other);
 
@@ -144,7 +148,8 @@ class theta_sketch {
   //!
   //! @param[in] stream CUDA stream this operation is executed in.
   //! @param[in] other The other sketch to intersect with `*this`.
-  //! @throws std::invalid_argument if the two sketches disagree on seed hash.
+  //! @throws std::invalid_argument if the seed hashes disagree and no
+  //!   empty-sketch shortcut applies.
   template <class OtherMR>
   void intersect(::cuda::stream_ref stream, const theta_sketch<Key, OtherMR>& other);
 
@@ -156,7 +161,8 @@ class theta_sketch {
   //!
   //! @param[in] stream CUDA stream this operation is executed in.
   //! @param[in] other The sketch to subtract from `*this`.
-  //! @throws std::invalid_argument if the two sketches disagree on seed hash.
+  //! @throws std::invalid_argument if the seed hashes disagree and no
+  //!   empty-sketch shortcut applies.
   template <class OtherMR>
   void a_not_b(::cuda::stream_ref stream, const theta_sketch<Key, OtherMR>& other);
 
@@ -195,7 +201,7 @@ class theta_sketch {
 
   //! @brief Current theta as a raw 64-bit hash threshold.
   //!
-  //! @return Theta in `[0, 2^63)`.
+  //! @return Theta in `[1, 2^63)`.
   [[nodiscard]] std::uint64_t get_theta64() const noexcept;
 
   //! @brief Current theta as a fraction of the hash space.
@@ -222,12 +228,16 @@ class theta_sketch {
   //!
   //! @param[in] num_std_devs Confidence level: 1, 2, or 3.
   //! @return The lower bound, or the exact count when not in estimation mode.
+  //! @throws std::invalid_argument if in estimation mode and `num_std_devs`
+  //!   is outside [1, 3].
   [[nodiscard]] double get_lower_bound(std::uint8_t num_std_devs) const;
 
   //! @brief Upper bound on the estimate.
   //!
   //! @param[in] num_std_devs Confidence level: 1, 2, or 3.
   //! @return The upper bound, or the exact count when not in estimation mode.
+  //! @throws std::invalid_argument if in estimation mode and `num_std_devs`
+  //!   is outside [1, 3].
   [[nodiscard]] double get_upper_bound(std::uint8_t num_std_devs) const;
 
   //! @brief Copy the ordered retained hashes to host memory.
@@ -253,6 +263,7 @@ class theta_sketch {
   //! CPU compact sketches can retain more than their nominal k before an
   //! explicit trim. Trim those sketches before serialization, or choose an
   //! `lg_k` large enough to hold every retained entry in the image.
+  //! The byte span must contain exactly one image, without trailing bytes.
   //!
   //! @param[in] stream CUDA stream this operation is executed in.
   //! @param[in] bytes Wire-format compact Theta v3 image.
