@@ -23,12 +23,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <cuda/memory_pool>
 #include <cuda/std/functional>
 #include <cuda/std/span>
 #include <cuda/stream>
-#include <iterator>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -55,7 +53,6 @@ namespace datasketches::cuda::detail::theta {
 
 template <class Key, class MR = ::cuda::device_memory_pool_ref>
 struct sketch_impl {
-  using key_type          = Key;
   using hash_type         = std::uint64_t;
   using count_type        = std::uint64_t;
   using hash_buffer_type  = ::cuda::device_buffer<hash_type>;
@@ -122,8 +119,9 @@ struct sketch_impl {
 
   static float check_p_(float p)
   {
-    if (!(p > 0.0F && p <= 1.0F)) {
-      throw std::invalid_argument("theta_sketch sampling probability must be in (0, 1]");
+    if (!(p > 0.0F && p <= 1.0F) || starting_theta_(p) == 0) {
+      throw std::invalid_argument(
+        "theta_sketch sampling probability must be in (0, 1] and yield a nonzero theta");
     }
     return p;
   }
@@ -176,23 +174,11 @@ struct sketch_impl {
     return static_cast<std::size_t>(host_count);
   }
 
+  template <class Predicate>
   [[nodiscard]] buffer_result select_(::cuda::stream_ref stream,
                                       const hash_type* input,
                                       std::size_t count,
-                                      screen_hash predicate) const
-  {
-    auto output = make_hash_buffer_(stream, count);
-    if (count == 0) return {std::move(output), 0};
-    auto selected = make_count_buffer_(stream);
-    DATASKETCHES_CUDA_TRY(cub::DeviceSelect::If(
-      input, output.data(), selected.data(), cub_count_(count), predicate, env_(stream)));
-    return {std::move(output), read_count_(stream, selected)};
-  }
-
-  [[nodiscard]] buffer_result select_(::cuda::stream_ref stream,
-                                      const hash_type* input,
-                                      std::size_t count,
-                                      membership_filter predicate) const
+                                      Predicate predicate) const
   {
     auto output = make_hash_buffer_(stream, count);
     if (count == 0) return {std::move(output), 0};
@@ -273,6 +259,7 @@ struct sketch_impl {
     return {std::move(output), survivors, survivors > capacity};
   }
 
+  //! @brief Merge sorted, individually unique ranges; only cross-range duplicates remain.
   [[nodiscard]] buffer_result merge_unique_(::cuda::stream_ref stream,
                                             const hash_type* first,
                                             std::size_t first_size,
@@ -283,27 +270,21 @@ struct sketch_impl {
     auto merged                   = make_hash_buffer_(stream, merged_size);
     if (merged_size == 0) return {std::move(merged), 0};
 
-    if (first_size == 0) {
+    if (first_size == 0 || second_size == 0) {
       DATASKETCHES_CUDA_TRY(cudaMemcpyAsync(merged.data(),
-                                            second,
-                                            second_size * sizeof(hash_type),
+                                            first_size == 0 ? second : first,
+                                            merged_size * sizeof(hash_type),
                                             cudaMemcpyDeviceToDevice,
                                             stream.get()));
-    } else if (second_size == 0) {
-      DATASKETCHES_CUDA_TRY(cudaMemcpyAsync(merged.data(),
-                                            first,
-                                            first_size * sizeof(hash_type),
-                                            cudaMemcpyDeviceToDevice,
-                                            stream.get()));
-    } else {
-      DATASKETCHES_CUDA_TRY(cub::DeviceMerge::MergeKeys(first,
-                                                        cub_count_(first_size),
-                                                        second,
-                                                        cub_count_(second_size),
-                                                        merged.data(),
-                                                        ::cuda::std::less<>{},
-                                                        env_(stream)));
+      return {std::move(merged), merged_size};
     }
+    DATASKETCHES_CUDA_TRY(cub::DeviceMerge::MergeKeys(first,
+                                                      cub_count_(first_size),
+                                                      second,
+                                                      cub_count_(second_size),
+                                                      merged.data(),
+                                                      ::cuda::std::less<>{},
+                                                      env_(stream)));
     return unique_sorted_(stream, merged.data(), merged_size);
   }
 
@@ -376,17 +357,16 @@ struct sketch_impl {
 
   //! @brief Margin between a chunk's expected survivors and the budget.
   //!
-  //! Survivors of distinct keys are a binomial draw at the theta fraction, and
-  //! at millions of expected survivors ten percent is hundreds of standard
-  //! deviations, so a chunk sized this way cannot overflow on its own.
+  //! Under the uniform-hash model, ten percent is a large margin at millions of
+  //! expected survivors. The screen write guard and retry still handle any
+  //! overflow, including input whose survivor rate exceeds the prediction.
   static constexpr double budget_margin = 1.1;
 
   //! @brief Hedge applied to the measured duplicate factor.
   //!
-  //! The duplicate factor is measured on the previous pass and only holds if
-  //! the input keeps its character. Doubling it before use means the screen can
-  //! overflow only if the share of keys getting past the duplicate filter more
-  //! than doubles from one chunk to the next.
+  //! The duplicate factor is measured on the previous pass. Doubling it allows
+  //! for variation in the next chunk; guarded writes and retries handle larger
+  //! changes in the survivor rate.
   static constexpr double duplicate_hedge = 2.0;
 
   //! @brief Smallest survivor budget, in hashes, that any k is given.
@@ -445,19 +425,19 @@ struct sketch_impl {
   //!
   //! Every chunk is also sized so that its expected survivors fit the survivor
   //! budget with @ref budget_margin to spare, which is what bounds the screen
-  //! buffer. The expected survivor fraction is theta over the hash space, exact
+  //! buffer. The survivor fraction is estimated from theta over the hash space
   //! for distinct keys, times the duplicate factor: the share of keys the
   //! screen's duplicate filter lets through, which the previous pass measured
-  //! and which is orders of magnitude below one for grouped or repeated input.
+  //! and which can be orders of magnitude below one for grouped or repeated input.
   //! Sizing from theta alone would cut such a batch into dozens of small chunks
   //! that each pay a launch and a readback. The measured factor is hedged by
-  //! @ref duplicate_hedge before use, so an overflow takes a change in the
-  //! input's character; when the screen does overflow, nothing is installed and
-  //! the caller retries with a chunk sized from the exact survivor count of the
+  //! @ref duplicate_hedge before use to allow for variation. On overflow,
+  //! nothing is installed and the caller retries with a chunk sized from the
+  //! exact survivor count of the
   //! failed pass. That failed pass is wasted work, so whenever the estimate
-  //! leans on a duplicate factor small enough to make an overflow possible at
-  //! all, growth per chunk is capped at @ref max_chunk_growth to keep the waste
-  //! proportional to the work already done. Below maximum theta the chunk is
+  //! leans on a duplicate factor below one half, growth per chunk is capped at
+  //! @ref max_chunk_growth to keep the waste proportional to the work already
+  //! done. Below maximum theta the chunk is
   //! never smaller than @ref min_chunk_keys, which is within the default budget
   //! so that floor cannot overflow either.
   //!
@@ -513,7 +493,10 @@ struct sketch_impl {
 
     auto incoming = sort_unique_(stream, std::move(screened.data), screened.count, theta_);
     auto combined =
-      merge_unique_(stream, hashes_.data(), hashes_.size(), incoming.data.data(), incoming.size);
+      hashes_.empty()
+        ? std::move(incoming)
+        : merge_unique_(
+            stream, hashes_.data(), hashes_.size(), incoming.data.data(), incoming.size);
     install_(stream, combined.data.data(), combined.size, theta_, false, true);
     return {true, screened.count};
   }

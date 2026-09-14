@@ -112,23 +112,6 @@ TEST_CASE("Theta compact v3 bytes match trimmed CPU in estimation mode",
   REQUIRE(estimate <= upper);
 }
 
-TEST_CASE("Theta incremental batches match a single CPU update sketch",
-          "[theta][parity][incremental]")
-{
-  constexpr std::uint8_t lg_k                      = 10;
-  auto keys                                        = make_keys(50000, 0x31415926ULL);
-  thrust::device_vector<std::uint64_t> device_keys = keys;
-
-  ::cuda::stream stream{::cuda::devices[0]};
-  auto mr = ::cuda::device_default_memory_pool(::cuda::devices[0]);
-  datasketches::cuda::theta_sketch<std::uint64_t> gpu(stream, mr, lg_k);
-  gpu.update(stream, device_keys.begin(), device_keys.begin() + 7777);
-  gpu.update(stream, device_keys.begin() + 7777, device_keys.begin() + 23456);
-  gpu.update(stream, device_keys.begin() + 23456, device_keys.end());
-
-  REQUIRE(gpu.serialize_compact(stream) == theta_test::cpu_image(keys, lg_k, 9001));
-}
-
 TEST_CASE("Theta p-sampling and custom seed match CPU", "[theta][parity][sampling]")
 {
   constexpr std::uint8_t lg_k                      = 12;
@@ -142,7 +125,15 @@ TEST_CASE("Theta p-sampling and custom seed match CPU", "[theta][parity][samplin
   datasketches::cuda::theta_sketch<std::uint64_t> gpu(stream, mr, lg_k, seed, p);
   gpu.update(stream, device_keys.begin(), device_keys.end());
 
-  REQUIRE(gpu.serialize_compact(stream) == theta_test::cpu_image(keys, lg_k, seed, p));
+  const auto bytes = gpu.serialize_compact(stream);
+  REQUIRE(bytes == theta_test::cpu_image(keys, lg_k, seed, p));
+
+  gpu.reset(stream);
+  REQUIRE(gpu.is_empty());
+  REQUIRE_FALSE(gpu.is_estimation_mode());
+  REQUIRE(gpu.get_num_retained() == 0);
+  gpu.update(stream, device_keys.begin(), device_keys.end());
+  REQUIRE(gpu.serialize_compact(stream) == bytes);
 }
 
 TEST_CASE("Theta compact v3 round trips through CPU and GPU", "[theta][serialization]")
@@ -165,6 +156,34 @@ TEST_CASE("Theta compact v3 round trips through CPU and GPU", "[theta][serializa
     stream, ::cuda::std::span<const std::uint8_t>{bytes.data(), bytes.size()}, mr, lg_k);
   REQUIRE(restored.serialize_compact(stream) == bytes);
   REQUIRE(restored.get_estimate() == Catch::Approx(source.get_estimate()));
+}
+
+TEST_CASE("Theta smallest sampling probability round trips", "[theta][sampling][serialization]")
+{
+  constexpr float min_p        = 0x1p-63F;
+  constexpr std::uint8_t lg_k  = 12;
+  constexpr std::uint64_t seed = 9001;
+  using sketch_type            = datasketches::cuda::theta_sketch<std::uint64_t>;
+
+  ::cuda::stream stream{::cuda::devices[0]};
+  auto mr = ::cuda::device_default_memory_pool(::cuda::devices[0]);
+  REQUIRE_THROWS_AS((sketch_type(stream, mr, lg_k, seed, std::nextafter(min_p, 0.0F))),
+                    std::invalid_argument);
+
+  const std::vector<std::uint64_t> values{0, 1, 2};
+  thrust::device_vector<std::uint64_t> device = values;
+  sketch_type sketch(stream, mr, lg_k, seed, min_p);
+  sketch.update(stream, device.begin(), device.end());
+  REQUIRE_FALSE(sketch.is_empty());
+  REQUIRE(sketch.get_theta64() == 1);
+  REQUIRE(sketch.get_num_retained() == 0);
+  REQUIRE(sketch.get_estimate() == 0.0);
+
+  const auto bytes = sketch.serialize_compact(stream);
+  REQUIRE(bytes == theta_test::cpu_image(values, lg_k, seed, min_p));
+  auto restored = sketch_type::deserialize(
+    stream, ::cuda::std::span<const std::uint8_t>{bytes.data(), bytes.size()}, mr, lg_k, seed);
+  REQUIRE(restored.serialize_compact(stream) == bytes);
 }
 
 TEST_CASE("Theta validates constructor and compact image", "[theta][validation]")
@@ -201,28 +220,7 @@ TEST_CASE("Theta validates constructor and compact image", "[theta][validation]"
     std::invalid_argument);
 }
 
-TEST_CASE("Theta multi-chunk update matches a single CPU sketch", "[theta][parity][chunking]")
-{
-  // Large enough that update() splits the batch internally: the sketch enters
-  // with theta at its maximum, so the first chunk is bounded and later chunks
-  // run against a tightened theta. Parity with the CPU sketch must not depend
-  // on how the batch happens to be split.
-  constexpr std::uint8_t lg_k  = 12;
-  constexpr std::uint64_t seed = 9001;
-  auto keys                    = make_keys(5'000'000, 0xc0ffeeULL);
-
-  thrust::device_vector<std::uint64_t> device_keys = keys;
-  ::cuda::stream stream{::cuda::devices[0]};
-  auto mr = ::cuda::device_default_memory_pool(::cuda::devices[0]);
-  datasketches::cuda::theta_sketch<std::uint64_t> gpu(stream, mr, lg_k, seed);
-  gpu.update(stream, device_keys.begin(), device_keys.end());
-
-  REQUIRE(gpu.is_estimation_mode());
-  REQUIRE(gpu.get_num_retained() == (std::size_t{1} << lg_k));
-  REQUIRE(gpu.serialize_compact(stream) == theta_test::cpu_image(keys, lg_k, seed));
-}
-
-TEST_CASE("Theta batch splitting does not change the result", "[theta][chunking]")
+TEST_CASE("Theta batch splitting does not change the result", "[theta][parity][chunking]")
 {
   // The same keys fed as one call and as several must produce identical images,
   // whether the split is the caller's or update()'s own.
@@ -244,6 +242,8 @@ TEST_CASE("Theta batch splitting does not change the result", "[theta][chunking]
     split.update(stream, device_keys.begin() + offset, device_keys.begin() + end);
   }
 
+  REQUIRE(single.is_estimation_mode());
+  REQUIRE(single.get_num_retained() == (std::size_t{1} << lg_k));
   REQUIRE(single.serialize_compact(stream) == split.serialize_compact(stream));
   REQUIRE(single.serialize_compact(stream) == theta_test::cpu_image(keys, lg_k, seed));
 }
@@ -312,7 +312,7 @@ TEST_CASE("Theta chunk sizing follows the survivor budget", "[theta][chunking][b
     // Leaning on a small duplicate factor caps growth over the previous chunk.
     REQUIRE(impl.next_chunk_(huge, budget, 1.0 / 64) == impl_type::max_chunk_growth * budget);
     REQUIRE(impl.next_chunk_(huge, 8 * budget, 1.0 / 64) == fits(budget, 1.0 / 256));
-    // With a duplicate factor of one half or more no overflow is possible, so
+    // A duplicate factor of one half or more uses only the theta estimate, so
     // growth is not capped.
     REQUIRE(impl.next_chunk_(huge, impl_type::min_chunk_keys, 0.75) == fits(budget, 1.0 / 8));
     REQUIRE(impl.next_chunk_(huge, impl_type::min_chunk_keys, -1.0) == fits(budget, 1.0 / 8));
@@ -432,7 +432,7 @@ TEST_CASE("Theta batch far above the budget with few distinct keys matches CPU",
   constexpr std::uint8_t lg_k    = 12;
   constexpr std::uint64_t seed   = 9001;
   constexpr std::size_t count    = std::size_t{3} << 22;
-  constexpr std::size_t distinct = 1'000;
+  constexpr std::size_t distinct = 3'000;
   const auto pool                = make_keys(distinct, 0xd15c0ULL);
   std::vector<std::uint64_t> keys(count);
   for (std::size_t i = 0; i < count; ++i)

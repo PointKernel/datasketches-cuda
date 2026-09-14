@@ -43,7 +43,6 @@ inline constexpr std::uint8_t flag_ordered    = 1U << 4;
 
 struct compact_image {
   bool empty;
-  std::uint16_t seed_hash;
   std::uint64_t theta;
   std::vector<std::uint64_t> entries;
 };
@@ -150,7 +149,7 @@ inline compact_image parse_compact_v3(::cuda::std::span<const std::uint8_t> byte
     throw std::invalid_argument("theta_sketch::deserialize: image size mismatch");
   }
 
-  compact_image image{empty, seed_hash, theta, std::vector<std::uint64_t>(count)};
+  compact_image image{empty, theta, std::vector<std::uint64_t>(count)};
   if (count != 0) {
     std::memcpy(image.entries.data(), bytes.data() + preamble_bytes, count * sizeof(std::uint64_t));
   }

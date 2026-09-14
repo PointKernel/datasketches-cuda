@@ -63,6 +63,10 @@ namespace datasketches::cuda {
 //! determines the next allocation size, so it must be read back on the host.
 //! That also means there are no `_async` variants yet, unlike `hll_sketch`.
 //! Both follow from the same eager readback and will change together.
+//! No-op updates and set operations may return without synchronizing unrelated
+//! work already queued on the supplied stream.
+//! Set operations can also take empty-sketch shortcuts without checking seed
+//! compatibility.
 //!
 //! **Stream lifetime.** The caller MUST keep the stream supplied at construction
 //! or deserialization alive until the sketch is destroyed. Retained buffers are
@@ -87,9 +91,10 @@ class theta_sketch {
   //! @param[in] lg_k Base 2 logarithm of the nominal number of retained entries.
   //! @param[in] seed Hash seed; sketches built with different seeds cannot be
   //!   combined.
-  //! @param[in] p Sampling probability, in (0, 1].
+  //! @param[in] p Sampling probability, in [2^-63, 1]. Smaller probabilities
+  //!   round the hash threshold to zero and are rejected.
   //! @throws std::invalid_argument if `lg_k` is outside [5, 26] or `p` is
-  //!   outside (0, 1].
+  //!   outside [2^-63, 1].
   theta_sketch(::cuda::stream_ref stream,
                MR mr,
                std::uint8_t lg_k  = default_lg_k,
@@ -106,7 +111,8 @@ class theta_sketch {
   //!
   //! Hashes each key, screens it against theta, and folds the surviving hashes
   //! into the retained set. Large batches are split internally so theta tightens
-  //! during the call. Synchronizes `stream` before returning.
+  //! during the call. Completes the update before returning; an empty range is
+  //! a no-op.
   //!
   //! @tparam RandomAccessIt Random-access iterator type over device-accessible
   //!   keys.
@@ -120,7 +126,7 @@ class theta_sketch {
 
   //! @brief Replace this sketch with the union of this and `other`.
   //!
-  //! Synchronizes `stream` before returning.
+  //! Completes any device work it submits before returning.
   //!
   //! @tparam OtherMR Memory resource type of `other`.
   //!
@@ -132,7 +138,7 @@ class theta_sketch {
 
   //! @brief Replace this sketch with the intersection of this and `other`.
   //!
-  //! Synchronizes `stream` before returning.
+  //! Completes any device work it submits before returning.
   //!
   //! @tparam OtherMR Memory resource type of `other`.
   //!
@@ -144,7 +150,7 @@ class theta_sketch {
 
   //! @brief Replace this sketch with the set difference this-minus-`other`.
   //!
-  //! Synchronizes `stream` before returning.
+  //! Completes any device work it submits before returning.
   //!
   //! @tparam OtherMR Memory resource type of `other`.
   //!
@@ -161,9 +167,11 @@ class theta_sketch {
   //! @param[in] stream CUDA stream this operation is executed in.
   void reset(::cuda::stream_ref stream);
 
-  //! @brief True iff the sketch has seen no keys.
+  //! @brief True iff the represented set is known to be empty.
   //!
-  //! @return True iff the sketch has seen no keys.
+  //! A sampled sketch with no retained hashes may still represent a nonempty
+  //! set. Exact set operations can establish emptiness after keys were seen.
+  //! @return True iff the represented set is known to be empty.
   [[nodiscard]] bool is_empty() const noexcept;
 
   //! @brief True iff theta has fallen below its maximum, so the retained count
@@ -242,6 +250,9 @@ class theta_sketch {
   //!
   //! Compact Theta images do not encode nominal k, so `lg_k` must be supplied
   //! by the caller when it differs from the default.
+  //! CPU compact sketches can retain more than their nominal k before an
+  //! explicit trim. Trim those sketches before serialization, or choose an
+  //! `lg_k` large enough to hold every retained entry in the image.
   //!
   //! @param[in] stream CUDA stream this operation is executed in.
   //! @param[in] bytes Wire-format compact Theta v3 image.
@@ -260,7 +271,7 @@ class theta_sketch {
 
  private:
   template <class, class>
-  friend class theta_sketch;  // Allow the implementation details to access the public API.
+  friend class theta_sketch;  // Allow set operations across memory-resource specializations.
 
   detail::theta::sketch_impl<Key, MR> impl_;  // Implementation details.
 };

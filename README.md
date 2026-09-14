@@ -100,7 +100,9 @@ starts with theta at its maximum is split internally, so theta tightens partway
 through the batch rather than only at the end; without that, a large first batch
 would sort every key even though the sketch keeps only k. Every update is also
 cut so that the survivors of one pass fit a fixed budget, which bounds the
-scratch memory of an update at around a hundred MiB rather than at the size of the batch;
+scratch memory independently of the batch size. The survivor budget is
+`max(2^22, 16*k)` hashes; at `lg_k=12`, measured peak scratch for `2^31`-key
+updates is 56–119 MiB. The budget grows with k above the `2^22` floor. The
 chunks are sized from theta and from the duplicate rate the previous pass
 observed, so steady input pays no extra passes for it. Its batch and set
 operations currently synchronize because result counts determine subsequent
@@ -179,6 +181,10 @@ additional dependency setup.
 - **Initial Theta surface.** Theta currently accepts primitive numeric keys and
   ordered, uncompressed compact-v3 images. Strings and byte spans, unordered or
   update-sketch images, compressed v4, and legacy wire versions are pending.
+  Imported images must fit the destination's `2^lg_k` entries: trim a CPU update
+  sketch before compacting it, or use a larger destination `lg_k`. Sampling
+  probabilities below `2^-63` are rejected because their hash threshold rounds
+  to zero.
 - **No LIST / SET deserialization.** The wire format's small-cardinality modes are rejected at parse. Sketches must already be in HLL mode.
 - **Round-trip diverges on `FLAGS` (oooFlag) and `hipAccum`.** GPU output always sets `oooFlag=1` (pins CPU side to the Composite estimator) and `hipAccum=0` (no HIP tracking on parallel atomic update). All other bytes round-trip exactly.
 - **CCCL uses a synthetic development version.** Until upstream tags a CCCL release containing the required cudax HLL policy and explicit stream / memory-resource APIs, `cmake/thirdparty/get_cccl.cmake` uses `CPMFindPackage` with synthetic version `3.5.2` and a pinned CCCL main commit. This prevents automatically accepting older CCCL installs from disk while keeping an explicit `CPM_CCCL_SOURCE` override available for development.

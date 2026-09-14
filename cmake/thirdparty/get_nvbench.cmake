@@ -31,7 +31,8 @@ function(find_and_configure_nvbench)
   CPMAddPackage(
     NAME nvbench
     GITHUB_REPOSITORY NVIDIA/nvbench
-    GIT_TAG main
+    # Keep the harness stable across builds and branch comparisons.
+    GIT_TAG 410dcdd21c9b48191ecb3d3d77060b1bf4ac6244
     OPTIONS
       "NVBench_ENABLE_NVML OFF"
       "NVBench_ENABLE_EXAMPLES OFF"
