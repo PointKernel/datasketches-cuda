@@ -30,43 +30,27 @@
 #include <datasketches/cuda/detail/theta/policy.cuh>
 #include <datasketches/cuda/detail/theta/sketch_impl.hpp>
 
+#include <binomial_bounds.hpp>
+
 namespace datasketches::cuda {
 
 //! @brief GPU Theta sketch with ordered compact serialization compatible with
 //! the datasketches::compact_theta_sketch serialization version 3.
 //!
-//! Updates are batch-oriented. A single kernel hashes each key, screens it
-//! against theta, filters duplicates, and compacts the survivors; CUB radix
-//! sort, unique, and merge primitives then fold those survivors into the
-//! retained set. The duplicate filter is best-effort and never affects the
-//! result, only how much redundant work reaches the sort. It costs a few percent
-//! when duplicates are scattered and pays back several times over when they
-//! arrive together, as they do in sorted or grouped input. An update that
-//! begins with theta at its maximum is split internally so theta tightens
-//! partway through the batch instead of after it, and a large update is split
-//! so that the device scratch memory it needs is bounded by a fixed survivor
-//! budget rather than by the batch size. The retained hashes are always
-//! ordered and trimmed to the smallest k = 2^lg_k values. Union (merge),
-//! intersection, and A-not-B operate directly on those ordered device-resident
-//! hashes.
+//! Updates are batch-oriented: a kernel hashes, screens against theta, and
+//! compacts the survivors, which CUB sort, unique, and merge fold into the
+//! ordered set of the k = 2^lg_k smallest retained hashes. Large updates are
+//! split so theta tightens partway through and scratch memory stays bounded.
+//! Set operations work directly on the ordered device-resident hashes.
 //!
-//! The current migration supports primitive device keys, uncompressed ordered
-//! compact-v3 serialization, custom seeds, and p-sampling. It does not yet
-//! support strings/byte spans, unordered or update-sketch wire images,
-//! compressed v4 images, or legacy serialization versions.
+//! Supports primitive device keys, ordered uncompressed compact-v3
+//! serialization, custom seeds, and p-sampling.
 //!
-//! CUDA work is explicit-resource: construction and every member function that
-//! touches the device take a caller-provided `cuda::stream_ref` as the first
-//! argument, and construction/deserialization require an explicit memory
-//! resource. Accessors that report sketch state take no stream because every
-//! operation that changes storage has already synchronized: the retained count
-//! determines the next allocation size, so it must be read back on the host.
-//! That also means there are no `_async` variants yet, unlike `hll_sketch`.
-//! Both follow from the same eager readback and will change together.
-//! No-op updates and set operations may return without synchronizing unrelated
-//! work already queued on the supplied stream.
-//! Set operations can also take empty-sketch shortcuts without checking seed
-//! compatibility.
+//! Every device operation takes an explicit `cuda::stream_ref` and completes
+//! before returning, because the retained count sizes the next allocation.
+//! Accessors therefore take no stream. No-op updates and set operations may
+//! return without synchronizing unrelated work queued on the stream, and
+//! set operations can take empty-sketch shortcuts without checking seeds.
 //!
 //! **Stream lifetime.** The caller MUST keep the stream supplied at construction
 //! or deserialization alive until the sketch is destroyed. Retained buffers are

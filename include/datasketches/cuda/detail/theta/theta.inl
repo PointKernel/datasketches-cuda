@@ -70,13 +70,13 @@ void theta_sketch<Key, MR>::reset(::cuda::stream_ref stream)
 template <class Key, class MR>
 bool theta_sketch<Key, MR>::is_empty() const noexcept
 {
-  return impl_.is_empty();
+  return impl_.is_empty_;
 }
 
 template <class Key, class MR>
 bool theta_sketch<Key, MR>::is_estimation_mode() const noexcept
 {
-  return impl_.is_estimation_mode();
+  return !impl_.is_empty_ && impl_.theta_ < detail::theta::max_theta;
 }
 
 template <class Key, class MR>
@@ -88,49 +88,53 @@ bool theta_sketch<Key, MR>::is_ordered() const noexcept
 template <class Key, class MR>
 std::uint8_t theta_sketch<Key, MR>::get_lg_k() const noexcept
 {
-  return impl_.get_lg_k();
+  return impl_.lg_k_;
 }
 
 template <class Key, class MR>
 std::uint64_t theta_sketch<Key, MR>::get_theta64() const noexcept
 {
-  return impl_.get_theta64();
+  return impl_.effective_theta();
 }
 
 template <class Key, class MR>
 double theta_sketch<Key, MR>::get_theta() const noexcept
 {
-  return impl_.get_theta();
+  return static_cast<double>(get_theta64()) / static_cast<double>(detail::theta::max_theta);
 }
 
 template <class Key, class MR>
 std::uint16_t theta_sketch<Key, MR>::get_seed_hash() const noexcept
 {
-  return impl_.get_seed_hash();
+  return ::compute_seed_hash(impl_.seed_);
 }
 
 template <class Key, class MR>
 std::size_t theta_sketch<Key, MR>::get_num_retained() const noexcept
 {
-  return impl_.get_num_retained();
+  return impl_.hashes_.size();
 }
 
 template <class Key, class MR>
 double theta_sketch<Key, MR>::get_estimate() const noexcept
 {
-  return impl_.get_estimate();
+  return static_cast<double>(get_num_retained()) / get_theta();
 }
 
 template <class Key, class MR>
 double theta_sketch<Key, MR>::get_lower_bound(std::uint8_t num_std_devs) const
 {
-  return impl_.get_lower_bound(num_std_devs);
+  if (!is_estimation_mode()) return static_cast<double>(get_num_retained());
+  return ::datasketches::binomial_bounds::get_lower_bound(
+    get_num_retained(), get_theta(), num_std_devs);
 }
 
 template <class Key, class MR>
 double theta_sketch<Key, MR>::get_upper_bound(std::uint8_t num_std_devs) const
 {
-  return impl_.get_upper_bound(num_std_devs);
+  if (!is_estimation_mode()) return static_cast<double>(get_num_retained());
+  return ::datasketches::binomial_bounds::get_upper_bound(
+    get_num_retained(), get_theta(), num_std_devs);
 }
 
 template <class Key, class MR>

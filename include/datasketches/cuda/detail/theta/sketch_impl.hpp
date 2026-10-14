@@ -46,8 +46,6 @@
 #include <datasketches/cuda/detail/theta/preamble.hpp>
 #include <datasketches/cuda/detail/theta/screen.cuh>
 
-#include <binomial_bounds.hpp>
-
 namespace datasketches::cuda::detail::theta {
 
 template <class Key, class MR = ::cuda::device_memory_pool_ref>
@@ -68,8 +66,7 @@ struct sketch_impl {
   std::uint64_t initial_theta_;
   std::uint64_t theta_;
   bool is_empty_;
-  //! @brief Screen output capacity in hashes; see @ref survivor_budget.
-  std::size_t survivor_budget_hashes_;
+  std::size_t survivor_budget_;  // Screen output capacity in hashes; tests lower it.
   ::cuda::stream_ref allocation_stream_;
   MR mr_;
   hash_buffer_type hashes_;
@@ -80,8 +77,7 @@ struct sketch_impl {
       initial_theta_(checked_theta(p)),
       theta_(initial_theta_),
       is_empty_(true),
-      survivor_budget_hashes_(
-        std::max(tuning::min_survivor_budget, tuning::chunk_target_multiple * k())),
+      survivor_budget_(std::max(tuning::min_survivor_budget, tuning::chunk_target_multiple * k())),
       allocation_stream_(stream),
       mr_(std::move(mr)),
       hashes_(make_hash_buffer(stream, 0))
@@ -118,6 +114,11 @@ struct sketch_impl {
   [[nodiscard]] std::uint64_t effective_theta() const noexcept
   {
     return is_empty_ ? max_theta : theta_;
+  }
+
+  [[nodiscard]] double theta_rate() const noexcept
+  {
+    return static_cast<double>(theta_) / static_cast<double>(max_theta);
   }
 
   [[nodiscard]] env_type env(::cuda::stream_ref stream) const { return env_type{mr_, stream}; }
@@ -192,14 +193,13 @@ struct sketch_impl {
                                      RandomAccessIt first,
                                      std::size_t count) const
   {
-    const std::size_t capacity = std::min(count, survivor_budget());
+    const std::size_t capacity = std::min(count, survivor_budget_);
     auto output                = make_hash_buffer(stream, capacity);
     auto selected              = make_count_buffer(stream);
     screen_kernel<<<tuning::grid_size(count), tuning::block_threads, 0, stream.get()>>>(
       first, count, theta_hash<Key>{seed_}, theta_, output.data(), capacity, selected.data());
     DATASKETCHES_CUDA_TRY(cudaGetLastError());
-    const std::size_t survivors = read_count(stream, selected);
-    return {std::move(output), survivors};
+    return {std::move(output), read_count(stream, selected)};
   }
 
   //! @brief Merge sorted, individually unique ranges; only cross-range duplicates remain.
@@ -255,17 +255,6 @@ struct sketch_impl {
     is_empty_ = empty;
   }
 
-  [[nodiscard]] std::size_t survivor_budget() const noexcept { return survivor_budget_hashes_; }
-
-  // Tests lower the budget to exercise guarded writes and retries.
-  void set_survivor_budget(std::size_t hashes)
-  {
-    if (hashes == 0) {
-      throw std::invalid_argument("theta_sketch survivor budget must be positive");
-    }
-    survivor_budget_hashes_ = hashes;
-  }
-
   // Predict survivors from theta and the last chunk's duplicate rate. Hedge
   // that rate and cap growth because the distribution can change mid-update.
   // At maximum theta, double chunks so distinct inputs tighten theta early.
@@ -274,12 +263,11 @@ struct sketch_impl {
                                        std::size_t previous,
                                        double duplicate_factor) const noexcept
   {
-    const std::size_t budget = survivor_budget();
-    const double theta_rate  = static_cast<double>(theta_) / static_cast<double>(max_theta);
-    const double hedged      = std::min(1.0, tuning::duplicate_hedge * duplicate_factor);
-    const double rate        = theta_rate * hedged;
-    const double target = rate > 0.0 ? static_cast<double>(budget) / (tuning::budget_margin * rate)
-                                     : static_cast<double>(remaining);
+    const double hedged = std::min(1.0, tuning::duplicate_hedge * duplicate_factor);
+    const double rate   = theta_rate() * hedged;
+    const double target = rate > 0.0
+                            ? static_cast<double>(survivor_budget_) / (tuning::budget_margin * rate)
+                            : static_cast<double>(remaining);
     std::size_t sized =
       target >= static_cast<double>(remaining) ? remaining : static_cast<std::size_t>(target);
     if (hedged < 1.0 && previous != 0 && sized / tuning::max_chunk_growth > previous) {
@@ -327,22 +315,21 @@ struct sketch_impl {
       auto chunk = next_chunk(count - offset, previous, duplicate_factor);
       // Theta is fixed until something is installed, so a pass's survivors per
       // key over the theta fraction it was screened at is its duplicate factor.
-      const double theta_rate = static_cast<double>(theta_) / static_cast<double>(max_theta);
-      auto outcome            = update_chunk(stream, first + offset, chunk);
-      while (outcome > survivor_budget()) {
-        duplicate_factor = static_cast<double>(outcome) / static_cast<double>(chunk) / theta_rate;
+      const double rate = theta_rate();
+      auto outcome      = update_chunk(stream, first + offset, chunk);
+      while (outcome > survivor_budget_) {
+        duplicate_factor = static_cast<double>(outcome) / static_cast<double>(chunk) / rate;
         // The exact survivor count of the failed pass usually lands the retry
         // within the budget at once; halving guarantees progress regardless,
         // since a chunk of at most the budget cannot overflow.
-        chunk = std::max<std::size_t>(
-          1, std::min(chunk / 2, next_chunk(count - offset, previous, duplicate_factor)));
+        chunk   = std::min(chunk / 2, next_chunk(count - offset, previous, duplicate_factor));
         outcome = update_chunk(stream, first + offset, chunk);
       }
       // Commit the empty flag only after a chunk succeeds. A chunk whose keys
       // are all rejected still counts as seen, but a failed first allocation
       // must leave an empty sketch unchanged.
       is_empty_        = false;
-      duplicate_factor = static_cast<double>(outcome) / static_cast<double>(chunk) / theta_rate;
+      duplicate_factor = static_cast<double>(outcome) / static_cast<double>(chunk) / rate;
       offset += chunk;
       previous = chunk;
     }
@@ -405,45 +392,6 @@ struct sketch_impl {
     install(stream, {make_hash_buffer(stream, 0), 0}, max_theta, true);
   }
 
-  [[nodiscard]] bool is_empty() const noexcept { return is_empty_; }
-
-  [[nodiscard]] bool is_estimation_mode() const noexcept
-  {
-    return !is_empty_ && theta_ < max_theta;
-  }
-
-  [[nodiscard]] std::uint8_t get_lg_k() const noexcept { return lg_k_; }
-
-  [[nodiscard]] std::uint64_t get_theta64() const noexcept { return effective_theta(); }
-
-  [[nodiscard]] double get_theta() const noexcept
-  {
-    return static_cast<double>(effective_theta()) / static_cast<double>(max_theta);
-  }
-
-  [[nodiscard]] std::uint16_t get_seed_hash() const noexcept { return ::compute_seed_hash(seed_); }
-
-  [[nodiscard]] std::size_t get_num_retained() const noexcept { return hashes_.size(); }
-
-  [[nodiscard]] double get_estimate() const noexcept
-  {
-    return static_cast<double>(hashes_.size()) / get_theta();
-  }
-
-  [[nodiscard]] double get_lower_bound(std::uint8_t num_std_devs) const
-  {
-    if (!is_estimation_mode()) return static_cast<double>(hashes_.size());
-    return ::datasketches::binomial_bounds::get_lower_bound(
-      hashes_.size(), get_theta(), num_std_devs);
-  }
-
-  [[nodiscard]] double get_upper_bound(std::uint8_t num_std_devs) const
-  {
-    if (!is_estimation_mode()) return static_cast<double>(hashes_.size());
-    return ::datasketches::binomial_bounds::get_upper_bound(
-      hashes_.size(), get_theta(), num_std_devs);
-  }
-
   [[nodiscard]] std::vector<hash_result_type> get_retained_hashes(::cuda::stream_ref stream) const
   {
     std::vector<hash_result_type> entries(hashes_.size());
@@ -461,7 +409,7 @@ struct sketch_impl {
   [[nodiscard]] std::vector<std::uint8_t> serialize_compact(::cuda::stream_ref stream) const
   {
     return serialize_compact_v3(
-      is_empty_, get_seed_hash(), effective_theta(), get_retained_hashes(stream));
+      is_empty_, ::compute_seed_hash(seed_), effective_theta(), get_retained_hashes(stream));
   }
 
   void load_compact(::cuda::stream_ref stream, const compact_image& image)

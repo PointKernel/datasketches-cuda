@@ -435,16 +435,13 @@ TEST_CASE("Theta screen overflow retries preserve the result", "[theta][parity][
   auto mr = ::cuda::device_default_memory_pool(::cuda::devices[0]);
 
   impl_type tiny(stream, mr, lg_k, seed, 1.0F);
-  REQUIRE_THROWS_AS(tiny.set_survivor_budget(0), std::invalid_argument);
-  tiny.set_survivor_budget(64);
+  tiny.survivor_budget_ = 64;
   {
     const auto result = tiny.screen(stream, keys.begin(), keys.end() - keys.begin());
     REQUIRE(result.data.size() == 64);
     REQUIRE(result.size > result.data.size());
   }
   tiny.update(stream, keys.begin(), keys.end());
-  REQUIRE(tiny.is_estimation_mode());
-  REQUIRE(tiny.get_num_retained() == (std::size_t{1} << lg_k));
 
   impl_type regular(stream, mr, lg_k, seed, 1.0F);
   regular.update(stream, keys.begin(), keys.end());
@@ -456,8 +453,8 @@ TEST_CASE("Theta screen overflow retries preserve the result", "[theta][parity][
   // The same holds when the keys arrive in several calls, so the retry path
   // composes with the caller's own batching.
   impl_type batched(stream, mr, lg_k, seed, 1.0F);
-  batched.set_survivor_budget(64);
-  const std::size_t batch = 7'001;
+  batched.survivor_budget_ = 64;
+  const std::size_t batch  = 7'001;
   for (std::size_t offset = 0; offset < keys.size(); offset += batch) {
     const auto end = std::min(offset + batch, keys.size());
     batched.update(stream, keys.begin() + offset, keys.begin() + end);

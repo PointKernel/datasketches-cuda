@@ -25,6 +25,9 @@
 
 #include <cuda_runtime.h>
 
+#include <cub/warp/warp_scan.cuh>
+
+#include <datasketches/cuda/detail/theta/policy.cuh>
 #include <datasketches/cuda/detail/theta/tuning.cuh>
 
 namespace datasketches::cuda::detail::theta {
@@ -47,6 +50,9 @@ __global__ void screen_kernel(KeyIt keys,
   constexpr unsigned int warp_width = 32;
   constexpr unsigned int full_mask  = 0xffffffffu;
   const unsigned int lane           = threadIdx.x % warp_width;
+
+  using warp_scan = cub::WarpScan<int>;
+  __shared__ typename warp_scan::TempStorage scan_storage[tuning::block_threads / warp_width];
 
   // A slot contains the entire hash; it publishes no other data. Relaxed
   // atomics suffice: stale observations can only emit another duplicate.
@@ -75,7 +81,7 @@ __global__ void screen_kernel(KeyIt keys,
       hashes[i]      = 0;
       const ::cuda::std::uint64_t hash =
         idx < num_keys ? hasher(keys[idx]) : ::cuda::std::uint64_t{0};
-      const bool survives = (hash != 0 && hash < theta);
+      const bool survives = screen_hash{theta}(hash);
 
       // Stage one: one lane per distinct hash in this warp continues.
       const auto peers = __match_any_sync(full_mask, survives ? hash : ::cuda::std::uint64_t{0});
@@ -93,22 +99,18 @@ __global__ void screen_kernel(KeyIt keys,
       }
     }
 
-    int scan = mine;
-#pragma unroll
-    for (unsigned int offset = 1; offset < warp_width; offset <<= 1) {
-      const int prev = __shfl_up_sync(full_mask, scan, offset);
-      if (lane >= offset) { scan += prev; }
-    }
-    const int warp_total = __shfl_sync(full_mask, scan, warp_width - 1);
+    int scan       = 0;
+    int warp_total = 0;
+    warp_scan(scan_storage[threadIdx.x / warp_width]).ExclusiveSum(mine, scan, warp_total);
     if (warp_total == 0) { continue; }
 
     unsigned long long warp_base = 0;
-    if (lane == warp_width - 1) {
+    if (lane == 0) {
       warp_base = atomicAdd(out_count, static_cast<unsigned long long>(warp_total));
     }
-    warp_base = __shfl_sync(full_mask, warp_base, warp_width - 1);
+    warp_base = __shfl_sync(full_mask, warp_base, 0);
 
-    auto cursor = warp_base + static_cast<unsigned long long>(scan - mine);
+    auto cursor = warp_base + static_cast<unsigned long long>(scan);
 #pragma unroll
     for (int i = 0; i < tuning::items_per_thread; ++i) {
       if (hashes[i] != 0) {

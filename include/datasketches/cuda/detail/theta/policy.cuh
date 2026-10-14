@@ -67,9 +67,7 @@ struct membership_filter {
   [[nodiscard]] __host__ __device__ bool operator()(std::uint64_t hash) const noexcept
   {
     if (!screen_hash{theta}(hash)) return false;
-    const bool found =
-      other_size != 0 && ::cuda::std::binary_search(other, other + other_size, hash);
-    return found == keep_matches;
+    return ::cuda::std::binary_search(other, other + other_size, hash) == keep_matches;
   }
 };
 

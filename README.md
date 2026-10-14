@@ -90,26 +90,13 @@ auto cpu = datasketches::compact_theta_sketch::deserialize(
 ```
 
 `theta_sketch` keeps ordered hashes in device memory. Each update chunk runs a
-kernel that hashes, screens against theta, drops duplicates it can cheaply
-recognize, and compacts the survivors, then folds them in with CUB radix sort,
-unique, and merge primitives. The duplicate filter is best-effort: it changes
-only how much redundant work reaches the sort, never the result. Nearby
-duplicates, such as those in sorted or grouped data, reduce the number of
-survivors that need sorting. An update that
-starts with theta at its maximum is split internally, so theta can tighten partway
-through the batch rather than only at the end; without that, a large first batch
-would sort every key even though the sketch keeps only k. Every update is also
-cut so that the survivors of one pass fit a fixed budget, which bounds the
-scratch memory independently of the batch size. The survivor budget is
-`max(2^22, 16*k)` hashes. At `lg_k=12`, the screen output alone is at most
-32 MiB; sorting and merging allocate additional buffers. The budget grows with
-k above the `2^22` floor. If fewer than k distinct keys keep theta at its maximum
-and the duplicate filter misses their repeats, each chunk still needs sorting.
-The chunks are sized from theta and from the duplicate rate the previous pass
-observed. Batch and set operations currently synchronize because result counts
-determine subsequent allocation sizes. This puts a fixed cost on each update
-chunk and each set-operation call: prefer fewer, larger updates over many small
-ones.
+kernel that hashes, screens against theta, drops nearby duplicates, and
+compacts the survivors, then folds them in with CUB radix sort, unique, and
+merge. Updates are split so theta tightens partway through a large batch and
+the survivors of one pass fit a budget of `max(2^22, 16*k)` hashes, bounding
+scratch memory independently of the batch size. Batch and set operations
+synchronize because result counts size later allocations, so prefer fewer,
+larger updates over many small ones.
 
 ## Build & Runtime Dependencies
 
