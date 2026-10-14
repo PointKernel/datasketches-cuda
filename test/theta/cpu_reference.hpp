@@ -51,45 +51,4 @@ set_operation_images cpu_set_operation_images(const std::vector<std::uint64_t>& 
                                               std::uint8_t lg_k,
                                               std::uint64_t seed = 9001);
 
-extern template std::vector<std::uint8_t> cpu_image(const std::vector<std::uint64_t>&,
-                                                    std::uint8_t,
-                                                    std::uint64_t,
-                                                    float);
-extern template std::vector<std::uint8_t> cpu_image(const std::vector<std::int64_t>&,
-                                                    std::uint8_t,
-                                                    std::uint64_t,
-                                                    float);
-extern template std::vector<std::uint8_t> cpu_image(const std::vector<std::uint32_t>&,
-                                                    std::uint8_t,
-                                                    std::uint64_t,
-                                                    float);
-extern template std::vector<std::uint8_t> cpu_image(const std::vector<std::int32_t>&,
-                                                    std::uint8_t,
-                                                    std::uint64_t,
-                                                    float);
-extern template std::vector<std::uint8_t> cpu_image(const std::vector<std::uint16_t>&,
-                                                    std::uint8_t,
-                                                    std::uint64_t,
-                                                    float);
-extern template std::vector<std::uint8_t> cpu_image(const std::vector<std::int16_t>&,
-                                                    std::uint8_t,
-                                                    std::uint64_t,
-                                                    float);
-extern template std::vector<std::uint8_t> cpu_image(const std::vector<std::uint8_t>&,
-                                                    std::uint8_t,
-                                                    std::uint64_t,
-                                                    float);
-extern template std::vector<std::uint8_t> cpu_image(const std::vector<std::int8_t>&,
-                                                    std::uint8_t,
-                                                    std::uint64_t,
-                                                    float);
-extern template std::vector<std::uint8_t> cpu_image(const std::vector<double>&,
-                                                    std::uint8_t,
-                                                    std::uint64_t,
-                                                    float);
-extern template std::vector<std::uint8_t> cpu_image(const std::vector<float>&,
-                                                    std::uint8_t,
-                                                    std::uint64_t,
-                                                    float);
-
 }  // namespace theta_test

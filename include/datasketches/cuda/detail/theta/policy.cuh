@@ -21,22 +21,22 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cuda/std/algorithm>
 
 #include <cuda_runtime.h>
 
-#include <datasketches/cuda/detail/hll/normalizing_hasher.cuh>
+#include <datasketches/cuda/detail/common/normalizing_hasher.cuh>
 
 namespace datasketches::cuda::detail::theta {
 
-inline constexpr std::uint64_t default_seed = detail::hll::default_seed;
-inline constexpr std::uint64_t max_theta    = 0x7fffffffffffffffULL;
-inline constexpr std::uint8_t min_lg_k      = 5;
-inline constexpr std::uint8_t max_lg_k      = 26;
-inline constexpr std::uint8_t default_lg_k  = 12;
+inline constexpr std::uint64_t max_theta   = 0x7fffffffffffffffULL;
+inline constexpr std::uint8_t min_lg_k     = 5;
+inline constexpr std::uint8_t max_lg_k     = 26;
+inline constexpr std::uint8_t default_lg_k = 12;
 
 template <class Key>
 struct theta_hash {
-  detail::hll::normalizing_hasher<Key> hasher;
+  detail::common::normalizing_hasher<Key> hasher;
 
   __host__ __device__ explicit constexpr theta_hash(std::uint64_t seed) noexcept : hasher(seed) {}
 
@@ -66,20 +66,9 @@ struct membership_filter {
 
   [[nodiscard]] __host__ __device__ bool operator()(std::uint64_t hash) const noexcept
   {
-    if (hash == 0 || hash >= theta) return false;
-    std::size_t first = 0;
-    std::size_t count = other_size;
-    while (count != 0) {
-      const std::size_t step = count / 2;
-      const std::size_t it   = first + step;
-      if (other[it] < hash) {
-        first = it + 1;
-        count -= step + 1;
-      } else {
-        count = step;
-      }
-    }
-    const bool found = first != other_size && other[first] == hash;
+    if (!screen_hash{theta}(hash)) return false;
+    const bool found =
+      other_size != 0 && ::cuda::std::binary_search(other, other + other_size, hash);
     return found == keep_matches;
   }
 };

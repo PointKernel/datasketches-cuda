@@ -27,17 +27,26 @@
 namespace theta_test {
 
 template <class T>
-std::vector<std::uint8_t> cpu_image(const std::vector<T>& values,
-                                    std::uint8_t lg_k,
-                                    std::uint64_t seed,
-                                    float p)
+auto cpu_compact(const std::vector<T>& values,
+                 std::uint8_t lg_k,
+                 std::uint64_t seed,
+                 float p = 1.0F)
 {
   auto sketch =
     ::datasketches::update_theta_sketch::builder().set_lg_k(lg_k).set_seed(seed).set_p(p).build();
   for (const auto value : values)
     sketch.update(value);
   sketch.trim();
-  return sketch.compact(true).serialize();
+  return sketch.compact(true);
+}
+
+template <class T>
+std::vector<std::uint8_t> cpu_image(const std::vector<T>& values,
+                                    std::uint8_t lg_k,
+                                    std::uint64_t seed,
+                                    float p)
+{
+  return cpu_compact(values, lg_k, seed, p).serialize();
 }
 
 compact_metadata cpu_metadata(const std::vector<std::uint8_t>& bytes, std::uint64_t seed)
@@ -53,18 +62,8 @@ set_operation_images cpu_set_operation_images(const std::vector<std::uint64_t>& 
                                               std::uint8_t lg_k,
                                               std::uint64_t seed)
 {
-  auto a_update =
-    ::datasketches::update_theta_sketch::builder().set_lg_k(lg_k).set_seed(seed).build();
-  auto b_update =
-    ::datasketches::update_theta_sketch::builder().set_lg_k(lg_k).set_seed(seed).build();
-  for (const auto value : a)
-    a_update.update(value);
-  for (const auto value : b)
-    b_update.update(value);
-  a_update.trim();
-  b_update.trim();
-  const auto a_compact = a_update.compact(true);
-  const auto b_compact = b_update.compact(true);
+  const auto a_compact = cpu_compact(a, lg_k, seed);
+  const auto b_compact = cpu_compact(b, lg_k, seed);
 
   auto set_union = ::datasketches::theta_union::builder().set_lg_k(lg_k).set_seed(seed).build();
   set_union.update(a_compact);
@@ -80,45 +79,22 @@ set_operation_images cpu_set_operation_images(const std::vector<std::uint64_t>& 
                               a_not_b.compute(a_compact, b_compact, true).serialize()};
 }
 
-template std::vector<std::uint8_t> cpu_image(const std::vector<std::uint64_t>&,
-                                             std::uint8_t,
-                                             std::uint64_t,
-                                             float);
-template std::vector<std::uint8_t> cpu_image(const std::vector<std::int64_t>&,
-                                             std::uint8_t,
-                                             std::uint64_t,
-                                             float);
-template std::vector<std::uint8_t> cpu_image(const std::vector<std::uint32_t>&,
-                                             std::uint8_t,
-                                             std::uint64_t,
-                                             float);
-template std::vector<std::uint8_t> cpu_image(const std::vector<std::int32_t>&,
-                                             std::uint8_t,
-                                             std::uint64_t,
-                                             float);
-template std::vector<std::uint8_t> cpu_image(const std::vector<std::uint16_t>&,
-                                             std::uint8_t,
-                                             std::uint64_t,
-                                             float);
-template std::vector<std::uint8_t> cpu_image(const std::vector<std::int16_t>&,
-                                             std::uint8_t,
-                                             std::uint64_t,
-                                             float);
-template std::vector<std::uint8_t> cpu_image(const std::vector<std::uint8_t>&,
-                                             std::uint8_t,
-                                             std::uint64_t,
-                                             float);
-template std::vector<std::uint8_t> cpu_image(const std::vector<std::int8_t>&,
-                                             std::uint8_t,
-                                             std::uint64_t,
-                                             float);
-template std::vector<std::uint8_t> cpu_image(const std::vector<double>&,
-                                             std::uint8_t,
-                                             std::uint64_t,
-                                             float);
-template std::vector<std::uint8_t> cpu_image(const std::vector<float>&,
-                                             std::uint8_t,
-                                             std::uint64_t,
-                                             float);
+// Keep upstream Theta templates out of CUDA translation units: NVCC mishandles
+// their scalar pseudo-destructor calls.
+#define INSTANTIATE_CPU_IMAGE(T)                \
+  template std::vector<std::uint8_t> cpu_image( \
+    const std::vector<T>&, std::uint8_t, std::uint64_t, float);
+
+INSTANTIATE_CPU_IMAGE(std::uint64_t)
+INSTANTIATE_CPU_IMAGE(std::int64_t)
+INSTANTIATE_CPU_IMAGE(std::uint32_t)
+INSTANTIATE_CPU_IMAGE(std::int32_t)
+INSTANTIATE_CPU_IMAGE(std::uint16_t)
+INSTANTIATE_CPU_IMAGE(std::int16_t)
+INSTANTIATE_CPU_IMAGE(std::uint8_t)
+INSTANTIATE_CPU_IMAGE(std::int8_t)
+INSTANTIATE_CPU_IMAGE(double)
+INSTANTIATE_CPU_IMAGE(float)
+#undef INSTANTIATE_CPU_IMAGE
 
 }  // namespace theta_test
