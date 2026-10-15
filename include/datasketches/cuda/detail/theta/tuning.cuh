@@ -19,29 +19,30 @@
 
 #pragma once
 
-#include <cstddef>
+#include <cuda/std/cstddef>
+#include <cuda/std/cstdint>
 
 namespace datasketches::cuda::detail::theta {
 
 struct tuning {
-  static constexpr int block_threads        = 256;
-  static constexpr int items_per_thread     = 8;
-  static constexpr std::size_t filter_slots = 1024;
-  static constexpr std::size_t tile_keys    = block_threads * items_per_thread;
+  static constexpr ::cuda::std::int32_t block_threads    = 256;
+  static constexpr ::cuda::std::int32_t items_per_thread = 8;
+  static constexpr ::cuda::std::size_t filter_slots      = 1024;
+  static constexpr ::cuda::std::size_t tile_keys         = block_threads * items_per_thread;
 
   // Amortize launches while bounding sort and screen scratch independently of input size.
-  static constexpr std::size_t chunk_target_multiple = 16;
-  static constexpr std::size_t min_chunk_keys        = std::size_t{1} << 20;
-  static constexpr std::size_t min_survivor_budget   = std::size_t{1} << 22;
-  static constexpr std::size_t max_chunk_growth      = 64;
-  static constexpr double budget_margin              = 1.1;
-  static constexpr double duplicate_hedge            = 2.0;
+  static constexpr ::cuda::std::size_t chunk_target_multiple = 16;
+  static constexpr ::cuda::std::size_t min_chunk_keys        = ::cuda::std::size_t{1} << 20;
+  static constexpr ::cuda::std::size_t min_survivor_budget   = ::cuda::std::size_t{1} << 22;
+  static constexpr ::cuda::std::size_t max_chunk_growth      = 64;
+  static constexpr double budget_margin                      = 1.1;
+  static constexpr double duplicate_hedge                    = 2.0;
 
-  static unsigned int grid_size(std::size_t count) noexcept
+  static ::cuda::std::uint32_t grid_size(::cuda::std::size_t count) noexcept
   {
-    constexpr auto max_blocks = std::size_t{0x7fffffff};
+    constexpr auto max_blocks = ::cuda::std::size_t{0x7fffffff};
     const auto blocks         = (count + tile_keys - 1) / tile_keys;
-    return static_cast<unsigned int>(blocks < max_blocks ? blocks : max_blocks);
+    return static_cast<::cuda::std::uint32_t>(blocks < max_blocks ? blocks : max_blocks);
   }
 };
 

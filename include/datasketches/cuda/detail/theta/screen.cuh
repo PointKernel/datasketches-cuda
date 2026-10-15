@@ -47,11 +47,11 @@ __global__ void screen_kernel(KeyIt keys,
                               ::cuda::std::size_t capacity,
                               unsigned long long* __restrict__ out_count)
 {
-  constexpr unsigned int warp_width = 32;
-  constexpr unsigned int full_mask  = 0xffffffffu;
-  const unsigned int lane           = threadIdx.x % warp_width;
+  constexpr ::cuda::std::uint32_t warp_width = 32;
+  constexpr ::cuda::std::uint32_t full_mask  = 0xffffffffu;
+  const ::cuda::std::uint32_t lane           = threadIdx.x % warp_width;
 
-  using warp_scan = cub::WarpScan<int>;
+  using warp_scan = cub::WarpScan<::cuda::std::int32_t>;
   __shared__ typename warp_scan::TempStorage scan_storage[tuning::block_threads / warp_width];
 
   // A slot contains the entire hash; it publishes no other data. Relaxed
@@ -72,10 +72,10 @@ __global__ void screen_kernel(KeyIt keys,
        base < num_keys;
        base += stride) {
     ::cuda::std::uint64_t hashes[tuning::items_per_thread];
-    int mine = 0;
+    ::cuda::std::int32_t mine = 0;
 
 #pragma unroll
-    for (int i = 0; i < tuning::items_per_thread; ++i) {
+    for (::cuda::std::int32_t i = 0; i < tuning::items_per_thread; ++i) {
       // strided within the tile so every load step stays fully coalesced
       const auto idx = base + i * tuning::block_threads + threadIdx.x;
       hashes[i]      = 0;
@@ -86,7 +86,7 @@ __global__ void screen_kernel(KeyIt keys,
       // Stage one: one lane per distinct hash in this warp continues.
       const auto peers = __match_any_sync(full_mask, survives ? hash : ::cuda::std::uint64_t{0});
       const bool leader =
-        survives && (__ffs(static_cast<int>(peers)) - 1) == static_cast<int>(lane);
+        survives && static_cast<::cuda::std::uint32_t>(__ffs(static_cast<int>(peers)) - 1) == lane;
 
       // Stage two: drop it if this block emitted the same hash recently.
       if (leader) {
@@ -99,8 +99,8 @@ __global__ void screen_kernel(KeyIt keys,
       }
     }
 
-    int scan       = 0;
-    int warp_total = 0;
+    ::cuda::std::int32_t scan       = 0;
+    ::cuda::std::int32_t warp_total = 0;
     warp_scan(scan_storage[threadIdx.x / warp_width]).ExclusiveSum(mine, scan, warp_total);
     if (warp_total == 0) { continue; }
 
@@ -112,7 +112,7 @@ __global__ void screen_kernel(KeyIt keys,
 
     auto cursor = warp_base + static_cast<unsigned long long>(scan);
 #pragma unroll
-    for (int i = 0; i < tuning::items_per_thread; ++i) {
+    for (::cuda::std::int32_t i = 0; i < tuning::items_per_thread; ++i) {
       if (hashes[i] != 0) {
         if (cursor < capacity) { out[cursor] = hashes[i]; }
         ++cursor;

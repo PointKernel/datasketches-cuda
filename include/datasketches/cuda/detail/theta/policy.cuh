@@ -19,9 +19,9 @@
 
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
 #include <cuda/std/algorithm>
+#include <cuda/std/cstddef>
+#include <cuda/std/cstdint>
 
 #include <cuda_runtime.h>
 
@@ -29,42 +29,46 @@
 
 namespace datasketches::cuda::detail::theta {
 
-inline constexpr std::uint64_t max_theta   = 0x7fffffffffffffffULL;
-inline constexpr std::uint8_t min_lg_k     = 5;
-inline constexpr std::uint8_t max_lg_k     = 26;
-inline constexpr std::uint8_t default_lg_k = 12;
+inline constexpr ::cuda::std::uint64_t max_theta   = 0x7fffffffffffffffULL;
+inline constexpr ::cuda::std::uint8_t min_lg_k     = 5;
+inline constexpr ::cuda::std::uint8_t max_lg_k     = 26;
+inline constexpr ::cuda::std::uint8_t default_lg_k = 12;
 
 template <class Key>
 struct theta_hash {
   detail::normalizing_hasher<Key> hasher;
 
-  __host__ __device__ explicit constexpr theta_hash(std::uint64_t seed) noexcept : hasher(seed) {}
+  __host__ __device__ explicit constexpr theta_hash(::cuda::std::uint64_t seed) noexcept
+    : hasher(seed)
+  {
+  }
 
-  [[nodiscard]] __host__ __device__ constexpr std::uint64_t operator()(
+  [[nodiscard]] __host__ __device__ constexpr ::cuda::std::uint64_t operator()(
     const Key& key) const noexcept
   {
     // DataSketches Theta uses the low MurmurHash3 word and an unsigned shift
     // by one, reserving zero as an empty-table sentinel.
-    return static_cast<std::uint64_t>(hasher(key)) >> 1;
+    return static_cast<::cuda::std::uint64_t>(hasher(key)) >> 1;
   }
 };
 
 struct screen_hash {
-  std::uint64_t theta;
+  ::cuda::std::uint64_t theta;
 
-  [[nodiscard]] __host__ __device__ constexpr bool operator()(std::uint64_t hash) const noexcept
+  [[nodiscard]] __host__ __device__ constexpr bool operator()(
+    ::cuda::std::uint64_t hash) const noexcept
   {
     return hash != 0 && hash < theta;
   }
 };
 
 struct membership_filter {
-  const std::uint64_t* other;
-  std::size_t other_size;
-  std::uint64_t theta;
+  const ::cuda::std::uint64_t* other;
+  ::cuda::std::size_t other_size;
+  ::cuda::std::uint64_t theta;
   bool keep_matches;
 
-  [[nodiscard]] __host__ __device__ bool operator()(std::uint64_t hash) const noexcept
+  [[nodiscard]] __host__ __device__ bool operator()(::cuda::std::uint64_t hash) const noexcept
   {
     if (!screen_hash{theta}(hash)) return false;
     return ::cuda::std::binary_search(other, other + other_size, hash) == keep_matches;
