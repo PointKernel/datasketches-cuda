@@ -51,7 +51,7 @@ namespace datasketches::cuda::detail::theta {
 template <class Key, class MR = ::cuda::device_memory_pool_ref>
 struct sketch_impl {
   using hash_result_type  = std::uint64_t;
-  using count_type        = unsigned long long;
+  using count_type        = std::uint64_t;
   using hash_buffer_type  = ::cuda::device_buffer<hash_result_type>;
   using count_buffer_type = ::cuda::device_buffer<count_type>;
   using env_type          = ::cuda::experimental::env_t<::cuda::mr::device_accessible>;

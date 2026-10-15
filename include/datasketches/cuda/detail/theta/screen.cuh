@@ -45,7 +45,7 @@ __global__ void screen_kernel(KeyIt keys,
                               ::cuda::std::uint64_t theta,
                               ::cuda::std::uint64_t* __restrict__ out,
                               ::cuda::std::size_t capacity,
-                              unsigned long long* __restrict__ out_count)
+                              ::cuda::std::uint64_t* __restrict__ out_count)
 {
   constexpr ::cuda::std::uint32_t warp_width = 32;
   constexpr ::cuda::std::uint32_t full_mask  = 0xffffffffu;
@@ -99,18 +99,19 @@ __global__ void screen_kernel(KeyIt keys,
       }
     }
 
+    // One atomic per warp: the warp scan yields each lane's offset and the total.
     ::cuda::std::int32_t scan       = 0;
     ::cuda::std::int32_t warp_total = 0;
     warp_scan(scan_storage[threadIdx.x / warp_width]).ExclusiveSum(mine, scan, warp_total);
     if (warp_total == 0) { continue; }
 
-    unsigned long long warp_base = 0;
+    ::cuda::std::uint64_t warp_base = 0;
     if (lane == 0) {
-      warp_base = atomicAdd(out_count, static_cast<unsigned long long>(warp_total));
+      warp_base =
+        ::cuda::atomic_ref<::cuda::std::uint64_t, ::cuda::thread_scope_device>{*out_count}
+          .fetch_add(static_cast<::cuda::std::uint64_t>(warp_total), ::cuda::memory_order_relaxed);
     }
-    warp_base = __shfl_sync(full_mask, warp_base, 0);
-
-    auto cursor = warp_base + static_cast<unsigned long long>(scan);
+    auto cursor = __shfl_sync(full_mask, warp_base, 0) + static_cast<::cuda::std::uint64_t>(scan);
 #pragma unroll
     for (::cuda::std::int32_t i = 0; i < tuning::items_per_thread; ++i) {
       if (hashes[i] != 0) {
