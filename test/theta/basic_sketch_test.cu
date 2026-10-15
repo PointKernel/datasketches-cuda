@@ -31,6 +31,7 @@
 
 #include <thrust/copy.h>
 #include <thrust/device_vector.h>
+#include <thrust/execution_policy.h>
 #include <thrust/random.h>
 #include <thrust/sequence.h>
 #include <thrust/shuffle.h>
@@ -96,7 +97,7 @@ struct failing_resource {
 thrust::device_vector<std::uint64_t> make_keys(std::size_t count, std::uint64_t first)
 {
   thrust::device_vector<std::uint64_t> keys(count);
-  thrust::sequence(keys.begin(), keys.end(), first);
+  thrust::sequence(thrust::device, keys.begin(), keys.end(), first);
   return keys;
 }
 
@@ -141,7 +142,7 @@ TEST_CASE("Theta compact v3 bytes match CPU in exact mode", "[theta][parity][ser
   constexpr std::uint64_t seed = 9001;
   auto keys                    = make_keys(1000, 0x12345678ULL);
   keys.resize(1200);
-  thrust::copy_n(keys.begin(), 200, keys.begin() + 1000);
+  thrust::copy_n(thrust::device, keys.begin(), 200, keys.begin() + 1000);
 
   ::cuda::stream stream{::cuda::devices[0]};
   auto mr = ::cuda::device_default_memory_pool(::cuda::devices[0]);
@@ -428,8 +429,8 @@ TEST_CASE("Theta screen overflow retries preserve the result", "[theta][parity][
   constexpr std::uint64_t seed = 9001;
   auto keys                    = make_keys(20'000, 0x0ff10adULL);
   keys.resize(25'000);
-  thrust::copy_n(keys.begin(), 5'000, keys.begin() + 20'000);  // duplicates
-  thrust::shuffle(keys.begin(), keys.end(), thrust::default_random_engine{0x5eed});
+  thrust::copy_n(thrust::device, keys.begin(), 5'000, keys.begin() + 20'000);  // duplicates
+  thrust::shuffle(thrust::device, keys.begin(), keys.end(), thrust::default_random_engine{0x5eed});
 
   ::cuda::stream stream{::cuda::devices[0]};
   auto mr = ::cuda::device_default_memory_pool(::cuda::devices[0]);
