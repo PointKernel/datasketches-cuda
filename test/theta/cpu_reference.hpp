@@ -19,7 +19,6 @@
 
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -30,15 +29,6 @@ std::vector<std::uint8_t> cpu_image(const std::vector<T>& values,
                                     std::uint8_t lg_k,
                                     std::uint64_t seed,
                                     float p = 1.0F);
-
-struct compact_metadata {
-  bool empty;
-  bool ordered;
-  std::size_t retained;
-  std::uint64_t theta;
-};
-
-compact_metadata cpu_metadata(const std::vector<std::uint8_t>& bytes, std::uint64_t seed = 9001);
 
 struct set_operation_images {
   std::vector<std::uint8_t> set_union;

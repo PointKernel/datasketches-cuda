@@ -49,14 +49,6 @@ std::vector<std::uint8_t> cpu_image(const std::vector<T>& values,
   return cpu_compact(values, lg_k, seed, p).serialize();
 }
 
-compact_metadata cpu_metadata(const std::vector<std::uint8_t>& bytes, std::uint64_t seed)
-{
-  const auto sketch =
-    ::datasketches::compact_theta_sketch::deserialize(bytes.data(), bytes.size(), seed);
-  return compact_metadata{
-    sketch.is_empty(), sketch.is_ordered(), sketch.get_num_retained(), sketch.get_theta64()};
-}
-
 set_operation_images cpu_set_operation_images(const std::vector<std::uint64_t>& a,
                                               const std::vector<std::uint64_t>& b,
                                               std::uint8_t lg_k,

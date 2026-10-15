@@ -17,7 +17,6 @@
  * under the License.
  */
 
-#include <cmath>
 #include <cstdint>
 #include <cuda/devices>
 #include <cuda/memory_pool>
@@ -57,56 +56,6 @@ sketch_type clone(::cuda::stream_ref stream,
 
 }  // namespace
 
-TEST_CASE("Theta exact union intersection and A-not-B", "[theta][setops]")
-{
-  constexpr std::uint8_t lg_k                   = 12;
-  auto a_values                                 = sequence(0, 1000);
-  auto b_values                                 = sequence(500, 1500);
-  thrust::device_vector<std::uint64_t> a_device = a_values;
-  thrust::device_vector<std::uint64_t> b_device = b_values;
-
-  ::cuda::stream stream{::cuda::devices[0]};
-  auto mr = ::cuda::device_default_memory_pool(::cuda::devices[0]);
-  sketch_type a(stream, mr, lg_k);
-  sketch_type b(stream, mr, lg_k);
-  a.update(stream, a_device.begin(), a_device.end());
-  b.update(stream, b_device.begin(), b_device.end());
-
-  auto union_result = clone(stream, mr, a, lg_k);
-  union_result.merge(stream, b);
-  REQUIRE(union_result.get_estimate() == 1500.0);
-  REQUIRE(union_result.get_num_retained() == 1500);
-
-  auto intersection_result = clone(stream, mr, a, lg_k);
-  intersection_result.intersect(stream, b);
-  REQUIRE(intersection_result.get_estimate() == 500.0);
-  REQUIRE(intersection_result.get_num_retained() == 500);
-
-  auto difference_result = clone(stream, mr, a, lg_k);
-  difference_result.a_not_b(stream, b);
-  REQUIRE(difference_result.get_estimate() == 500.0);
-  REQUIRE(difference_result.get_num_retained() == 500);
-}
-
-TEST_CASE("Theta exact disjoint intersection is empty", "[theta][setops][empty]")
-{
-  auto a_values                                 = sequence(0, 100);
-  auto b_values                                 = sequence(100, 200);
-  thrust::device_vector<std::uint64_t> a_device = a_values;
-  thrust::device_vector<std::uint64_t> b_device = b_values;
-
-  ::cuda::stream stream{::cuda::devices[0]};
-  auto mr = ::cuda::device_default_memory_pool(::cuda::devices[0]);
-  sketch_type a(stream, mr, 12);
-  sketch_type b(stream, mr, 12);
-  a.update(stream, a_device.begin(), a_device.end());
-  b.update(stream, b_device.begin(), b_device.end());
-
-  a.intersect(stream, b);
-  REQUIRE(a.is_empty());
-  REQUIRE(a.get_estimate() == 0.0);
-}
-
 TEST_CASE("Theta set operations reject seed mismatch", "[theta][setops][seed]")
 {
   auto values                                 = sequence(0, 100);
@@ -122,28 +71,6 @@ TEST_CASE("Theta set operations reject seed mismatch", "[theta][setops][seed]")
   REQUIRE_THROWS_AS(a.merge(stream, b), std::invalid_argument);
   REQUIRE_THROWS_AS(a.intersect(stream, b), std::invalid_argument);
   REQUIRE_THROWS_AS(a.a_not_b(stream, b), std::invalid_argument);
-}
-
-TEST_CASE("Theta union trims to target k", "[theta][setops][estimation]")
-{
-  constexpr std::uint8_t lg_k                   = 8;
-  auto a_values                                 = sequence(0, 10000);
-  auto b_values                                 = sequence(10000, 20000);
-  thrust::device_vector<std::uint64_t> a_device = a_values;
-  thrust::device_vector<std::uint64_t> b_device = b_values;
-
-  ::cuda::stream stream{::cuda::devices[0]};
-  auto mr = ::cuda::device_default_memory_pool(::cuda::devices[0]);
-  sketch_type a(stream, mr, lg_k);
-  sketch_type b(stream, mr, lg_k);
-  a.update(stream, a_device.begin(), a_device.end());
-  b.update(stream, b_device.begin(), b_device.end());
-
-  a.merge(stream, b);
-  REQUIRE(a.is_estimation_mode());
-  REQUIRE(a.get_num_retained() == (std::size_t{1} << lg_k));
-  const double relative_error = std::abs(a.get_estimate() - 20000.0) / 20000.0;
-  REQUIRE(relative_error < 0.2);
 }
 
 TEST_CASE("Theta empty sampled union applies its configured p", "[theta][setops][sampling][parity]")
@@ -164,13 +91,28 @@ TEST_CASE("Theta empty sampled union applies its configured p", "[theta][setops]
   REQUIRE(sampled_union.serialize_compact(stream) == theta_test::cpu_image(values, lg_k, seed, p));
 }
 
-TEST_CASE("Theta estimated set operations match CPU compact bytes",
-          "[theta][setops][parity][serialization]")
+TEST_CASE("Theta set operations match CPU compact bytes", "[theta][setops][parity][serialization]")
 {
-  constexpr std::uint8_t lg_k = 8;
-  auto a_values               = sequence(0, 10000);
-  auto b_values               = sequence(5000, 15000);
-  const auto cpu              = theta_test::cpu_set_operation_images(a_values, b_values, lg_k);
+  std::uint8_t lg_k = 12;
+  std::vector<std::uint64_t> a_values;
+  std::vector<std::uint64_t> b_values;
+  SECTION("exact overlap")
+  {
+    a_values = sequence(0, 1000);
+    b_values = sequence(500, 1500);
+  }
+  SECTION("exact disjoint")
+  {
+    a_values = sequence(0, 100);
+    b_values = sequence(100, 200);
+  }
+  SECTION("estimated overlap")
+  {
+    lg_k     = 8;
+    a_values = sequence(0, 10000);
+    b_values = sequence(5000, 15000);
+  }
+  const auto cpu = theta_test::cpu_set_operation_images(a_values, b_values, lg_k);
 
   thrust::device_vector<std::uint64_t> a_device = a_values;
   thrust::device_vector<std::uint64_t> b_device = b_values;
