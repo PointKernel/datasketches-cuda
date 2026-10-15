@@ -114,42 +114,6 @@ void theta_update_cold(nvbench::state& state)
   });
 }
 
-//! @brief Cost of repeatedly updating a saturated sketch with the same batch.
-//!
-//! Unique priming keys put the sketch into estimation mode regardless of the
-//! measured batch's cardinality. Applying that batch once outside timing makes
-//! subsequent updates stable, including when the batch introduces more keys.
-void theta_update_warm(nvbench::state& state)
-{
-  const auto num_keys     = static_cast<std::size_t>(state.get_int64("Keys"));
-  const auto distinct_pct = state.get_int64("DistinctPct");
-  const auto lg_k         = static_cast<std::uint8_t>(state.get_int64("LgK"));
-  const auto grouped      = state.get_string("Layout") == "grouped";
-  const auto distinct     = std::max<std::uint64_t>(1, num_keys * distinct_pct / 100);
-
-  if (grouped && distinct == num_keys) {
-    state.skip("Distinct keys have the same scattered and grouped layout");
-    return;
-  }
-  const auto prime_keys = std::max<std::size_t>(std::size_t{16} << lg_k, num_keys / 10);
-  const auto keys       = make_keys(num_keys, distinct, grouped);
-  const auto prime      = make_keys(prime_keys, prime_keys);
-  auto mr               = ::cuda::device_default_memory_pool(::cuda::devices[0]);
-
-  ::cuda::stream setup_stream{::cuda::devices[0]};
-  datasketches::cuda::theta_sketch<key_type> sketch(setup_stream, mr, lg_k);
-  sketch.update(setup_stream, prime.begin(), prime.end());
-  sketch.update(setup_stream, keys.begin(), keys.end());
-
-  state.add_element_count(num_keys, "Keys");
-  state.add_global_memory_reads<key_type>(num_keys);
-
-  state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-    ::cuda::stream_ref stream{launch.get_stream()};
-    sketch.update(stream, keys.begin(), keys.end());
-  });
-}
-
 //! @brief Cost of feeding a fixed key count through many small update() calls.
 //!
 //! Each call carries a fixed cost in launches and synchronizations that does not
@@ -206,13 +170,6 @@ void theta_merge(nvbench::state& state)
 
 NVBENCH_BENCH(theta_update_cold)
   .set_name("theta_update_cold")
-  .add_int64_axis("Keys", {1 << 20, 1 << 24, 100'000'000})
-  .add_int64_axis("DistinctPct", {100, 1})
-  .add_string_axis("Layout", {"scattered", "grouped"})
-  .add_int64_axis("LgK", {12, 20});
-
-NVBENCH_BENCH(theta_update_warm)
-  .set_name("theta_update_warm")
   .add_int64_axis("Keys", {1 << 20, 1 << 24, 100'000'000})
   .add_int64_axis("DistinctPct", {100, 1})
   .add_string_axis("Layout", {"scattered", "grouped"})
