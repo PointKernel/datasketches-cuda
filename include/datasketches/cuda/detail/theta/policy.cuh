@@ -36,7 +36,7 @@ inline constexpr std::uint8_t default_lg_k = 12;
 
 template <class Key>
 struct theta_hash {
-  detail::common::normalizing_hasher<Key> hasher;
+  detail::normalizing_hasher<Key> hasher;
 
   __host__ __device__ explicit constexpr theta_hash(std::uint64_t seed) noexcept : hasher(seed) {}
 

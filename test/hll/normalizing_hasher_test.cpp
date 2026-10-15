@@ -33,7 +33,7 @@
 
 #include <datasketches/cuda/detail/common/normalizing_hasher.cuh>
 
-using datasketches::cuda::detail::common::normalizing_hasher;
+using datasketches::cuda::detail::normalizing_hasher;
 
 // Helper: invoke normalizing_hasher with seed 9001 (same as all tests).
 template <class T>

@@ -66,7 +66,7 @@ class theta_sketch {
   using hash_type = std::uint64_t;
 
   static constexpr std::uint8_t default_lg_k  = detail::theta::default_lg_k;
-  static constexpr std::uint64_t default_seed = detail::common::default_seed;
+  static constexpr std::uint64_t default_seed = detail::default_seed;
 
   //! @brief Construct an empty sketch on a caller-provided stream.
   //!
