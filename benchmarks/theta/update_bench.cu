@@ -23,8 +23,9 @@
 #include <cuda/memory_pool>
 #include <cuda/stream>
 
+#include <cuda/iterator>
+
 #include <thrust/device_vector.h>
-#include <thrust/iterator/counting_iterator.h>
 #include <thrust/transform.h>
 
 #include <datasketches/cuda/theta.hpp>
@@ -78,8 +79,8 @@ thrust::device_vector<key_type> make_keys(std::size_t count,
   const auto repeats = count / distinct;
   const auto extra   = count % distinct;
   thrust::device_vector<key_type> keys(count);
-  thrust::transform(thrust::counting_iterator<std::uint64_t>(0),
-                    thrust::counting_iterator<std::uint64_t>(count),
+  thrust::transform(::cuda::counting_iterator<std::uint64_t>{0},
+                    ::cuda::counting_iterator<std::uint64_t>{count},
                     keys.begin(),
                     generate_key{distinct, repeats, extra, extra * (repeats + 1), grouped});
   return keys;
