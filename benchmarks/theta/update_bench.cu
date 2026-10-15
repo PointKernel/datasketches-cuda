@@ -22,6 +22,7 @@
 #include <cuda/devices>
 #include <cuda/iterator>
 #include <cuda/memory_pool>
+#include <cuda/std/cstdint>
 #include <cuda/stream>
 
 #include <thrust/device_vector.h>
@@ -34,7 +35,7 @@
 
 namespace {
 
-using key_type = std::uint64_t;
+using key_type = ::cuda::std::uint64_t;
 
 //! @brief Generates keys with a controlled distinct count and arrival locality.
 //!
@@ -50,19 +51,19 @@ using key_type = std::uint64_t;
 //! that only ever generates scattered repeats cannot distinguish an optimization that
 //! exploits locality from one that does nothing.
 struct generate_key {
-  std::uint64_t distinct;
-  std::uint64_t repeats;
-  std::uint64_t extra;
-  std::uint64_t grouped_prefix;
+  ::cuda::std::uint64_t distinct;
+  ::cuda::std::uint64_t repeats;
+  ::cuda::std::uint64_t extra;
+  ::cuda::std::uint64_t grouped_prefix;
   bool grouped;
 
-  __host__ __device__ key_type operator()(std::uint64_t index) const noexcept
+  __host__ __device__ key_type operator()(::cuda::std::uint64_t index) const noexcept
   {
-    const auto key      = !grouped
-                            ? index % distinct
-                            : (index < grouped_prefix ? index / (repeats + 1)
-                                                      : extra + (index - grouped_prefix) / repeats);
-    std::uint64_t value = key + 0x9e3779b97f4a7c15ULL;
+    const auto key              = !grouped
+                                    ? index % distinct
+                                    : (index < grouped_prefix ? index / (repeats + 1)
+                                                              : extra + (index - grouped_prefix) / repeats);
+    ::cuda::std::uint64_t value = key + 0x9e3779b97f4a7c15ULL;
     value ^= value >> 30;
     value *= 0xbf58476d1ce4e5b9ULL;
     value ^= value >> 27;
@@ -73,15 +74,15 @@ struct generate_key {
 };
 
 thrust::device_vector<key_type> make_keys(std::size_t count,
-                                          std::uint64_t distinct,
+                                          ::cuda::std::uint64_t distinct,
                                           bool grouped = false)
 {
   const auto repeats = count / distinct;
   const auto extra   = count % distinct;
   thrust::device_vector<key_type> keys(count);
   thrust::transform(thrust::device,
-                    ::cuda::counting_iterator<std::uint64_t>{0},
-                    ::cuda::counting_iterator<std::uint64_t>{count},
+                    ::cuda::counting_iterator<::cuda::std::uint64_t>{0},
+                    ::cuda::counting_iterator<::cuda::std::uint64_t>{count},
                     keys.begin(),
                     generate_key{distinct, repeats, extra, extra * (repeats + 1), grouped});
   return keys;
