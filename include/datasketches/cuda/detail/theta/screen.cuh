@@ -22,6 +22,7 @@
 #include <cuda/atomic>
 #include <cuda/std/cstddef>
 #include <cuda/std/cstdint>
+#include <cuda/utility>
 
 #include <cuda_runtime.h>
 
@@ -74,8 +75,7 @@ __global__ void screen_kernel(KeyIt keys,
     ::cuda::std::uint64_t hashes[tuning::items_per_thread];
     ::cuda::std::int32_t mine = 0;
 
-#pragma unroll
-    for (::cuda::std::int32_t i = 0; i < tuning::items_per_thread; ++i) {
+    ::cuda::static_for<tuning::items_per_thread>([&](auto i) {
       // strided within the tile so every load step stays fully coalesced
       const auto idx = base + i * tuning::block_threads + threadIdx.x;
       hashes[i]      = 0;
@@ -97,7 +97,7 @@ __global__ void screen_kernel(KeyIt keys,
           ++mine;
         }
       }
-    }
+    });
 
     // One atomic per warp: the warp scan yields each lane's offset and the total.
     ::cuda::std::int32_t scan       = 0;
@@ -112,13 +112,12 @@ __global__ void screen_kernel(KeyIt keys,
           .fetch_add(static_cast<::cuda::std::uint64_t>(warp_total), ::cuda::memory_order_relaxed);
     }
     auto cursor = __shfl_sync(full_mask, warp_base, 0) + static_cast<::cuda::std::uint64_t>(scan);
-#pragma unroll
-    for (::cuda::std::int32_t i = 0; i < tuning::items_per_thread; ++i) {
+    ::cuda::static_for<tuning::items_per_thread>([&](auto i) {
       if (hashes[i] != 0) {
         if (cursor < capacity) { out[cursor] = hashes[i]; }
         ++cursor;
       }
-    }
+    });
   }
 }
 
