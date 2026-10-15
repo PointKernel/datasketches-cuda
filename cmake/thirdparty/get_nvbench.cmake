@@ -32,7 +32,7 @@ function(find_and_configure_nvbench)
     NAME nvbench
     GITHUB_REPOSITORY NVIDIA/nvbench
     # Keep the harness stable across builds and branch comparisons.
-    GIT_TAG 410dcdd21c9b48191ecb3d3d77060b1bf4ac6244
+    GIT_TAG a7fe2f3d47980a48a21dac5d407dd8eff007dfc4
     OPTIONS
       "NVBench_ENABLE_NVML OFF"
       "NVBench_ENABLE_EXAMPLES OFF"
